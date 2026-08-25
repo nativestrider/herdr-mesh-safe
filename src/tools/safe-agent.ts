@@ -208,7 +208,7 @@ async function getSnapshot(run: Runner, target: string, signal?: AbortSignal): P
   return { ...extractAgentSnapshot(result.json), target };
 }
 
-async function waitForSettled(
+export async function waitForSettled(
   run: Runner,
   target: string,
   timeoutMs: number,

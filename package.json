@@ -1,9 +1,10 @@
 {
   "name": "herdr-mesh-safe",
-  "version": "0.1.0-safe.12",
+  "version": "0.1.0-safe.13",
   "description": "A safety-scoped MCP bridge for semantic waits and lease-managed agents in Herdr.",
   "type": "module",
   "bin": {
+    "herdr-agent-control": "dist/agent-control.js",
     "herdr-mesh": "dist/index.js",
     "herdr-mesh-safe": "dist/index.js"
   },
@@ -11,7 +12,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js",
+    "build": "tsc && chmod +x dist/index.js dist/agent-control.js",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "node --import tsx --test test/*.test.ts"

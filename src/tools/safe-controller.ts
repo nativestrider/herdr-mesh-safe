@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { z } from "zod";
 import { runHerdr, type HerdrResult } from "../herdr.js";
 import { ControllerLeaseStore, type ControllerLease } from "../lease-store.js";
+import { processDescendsFrom, readProcessIdentity, type ProcessIdentity } from "../process-attestation.js";
 import { ok, type ToolDef } from "./types.js";
 
 const SHA256 = /^[0-9a-f]{64}$/i;
@@ -22,24 +23,39 @@ export interface ControllerAuthorityDependencies {
   store: ControllerLeaseStore;
   now: () => Date;
   callerPaneId?: string;
+  callerProcessId?: number;
+  processDescendsFrom?: (callerPid: number, expected: ProcessIdentity) => Promise<boolean>;
 }
 
 export interface SafeControllerDependencies extends ControllerAuthorityDependencies {
   run: Runner;
   uuid: () => string;
+  controllerProcessIdentity?: () => Promise<ProcessIdentity | undefined>;
 }
 
 export const defaultControllerAuthorityDependencies: ControllerAuthorityDependencies = {
   store: new ControllerLeaseStore(),
   now: () => new Date(),
   callerPaneId: process.env.HERDR_PANE_ID,
+  callerProcessId: process.pid,
+  processDescendsFrom,
 };
 
 const defaultDependencies: SafeControllerDependencies = {
   ...defaultControllerAuthorityDependencies,
   run: runHerdr,
   uuid: randomUUID,
+  controllerProcessIdentity: () => process.platform === "linux"
+    ? readProcessIdentity(process.ppid)
+    : Promise.resolve(undefined),
 };
+
+function controllerProcessIdentity(
+  dependencies: SafeControllerDependencies,
+): Promise<ProcessIdentity | undefined> {
+  if (dependencies.controllerProcessIdentity) return dependencies.controllerProcessIdentity();
+  return process.platform === "linux" ? readProcessIdentity(process.ppid) : Promise.resolve(undefined);
+}
 
 function requireCallerPaneId(callerPaneId?: string): string {
   if (!callerPaneId) {
@@ -91,6 +107,32 @@ function identityMatches(lease: ControllerLease, snapshot: AgentSnapshot): boole
     lease.agentKind === snapshot.kind &&
     Boolean(snapshot.cwd) &&
     resolve(lease.cwd) === resolve(String(snapshot.cwd));
+}
+
+export async function currentCallerControllerAuthority(
+  controllerId: string,
+  dependencies: SafeControllerDependencies = defaultDependencies,
+): Promise<ControllerLease> {
+  const lease = await dependencies.store.get(controllerId);
+  await dependencies.store.assertActive(
+    controllerId,
+    lease.leaseId,
+    lease.fenceToken,
+    dependencies.now(),
+  );
+  const snapshot = callerIdentity(await liveAgents(dependencies.run), dependencies.callerPaneId);
+  if (!identityMatches(lease, snapshot)) {
+    throw new Error("controller lease does not match the current named Herdr agent");
+  }
+  if (!lease.controllerProcess) {
+    throw new Error("controller lease lacks process attestation; resume it from the coordinator pane");
+  }
+  const callerProcessId = dependencies.callerProcessId ?? process.pid;
+  const descendsFrom = dependencies.processDescendsFrom ?? processDescendsFrom;
+  if (!await descendsFrom(callerProcessId, lease.controllerProcess)) {
+    throw new Error("agent-control process is not descended from the active controller process");
+  }
+  return lease;
 }
 
 function expiry(now: Date, ttlSeconds: number): string {
@@ -157,6 +199,7 @@ export function createSafeControllerTools(dependencies = defaultDependencies): T
           acquiredAt: now.toISOString(),
           renewedAt: now.toISOString(),
           expiresAt: expiry(now, ttl),
+          controllerProcess: await controllerProcessIdentity(dependencies),
         };
         const previous = await dependencies.store.getOptional(lease.controllerId);
         if (previous) lease.generation = previous.generation + 1;
@@ -195,6 +238,7 @@ export function createSafeControllerTools(dependencies = defaultDependencies): T
           expiresAt: expiry(now, ttl),
           predecessorLeaseId: previous.leaseId,
           releasedAt: undefined,
+          controllerProcess: await controllerProcessIdentity(dependencies),
         };
         await dependencies.store.replace(lease, previous.leaseId);
         return ok(JSON.stringify({ lease }, null, 2));
@@ -245,6 +289,7 @@ export function createSafeControllerTools(dependencies = defaultDependencies): T
           expiresAt: expiry(now, ttl),
           predecessorLeaseId: previous.leaseId,
           releasedAt: undefined,
+          controllerProcess: await controllerProcessIdentity(dependencies),
         };
         await dependencies.store.replace(lease, previous.leaseId);
         return ok(JSON.stringify({ lease }, null, 2));

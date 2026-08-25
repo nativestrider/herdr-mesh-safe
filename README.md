@@ -8,7 +8,7 @@ This repository is a fork of
 the upstream MCP/Herdr integration and replaces unrestricted terminal lifecycle
 with semantic waits and lease-scoped reviewers and writers.
 
-Current package version: `0.1.0-safe.12`.
+Current package version: `0.1.0-safe.13`.
 
 ## Why this fork exists
 
@@ -23,6 +23,8 @@ invariants:
 - no raw `send-keys`;
 - no unscoped pane, tab, workspace, or session deletion;
 - controller credentials are checked immediately before bridge prompts and lifecycle requests;
+- every prompt to a retained agent is admitted only while all lifecycle and handoff-receipt stores are locked;
+- result collection is bound to the exact leased pane and the accepted prompt cursor;
 - automatic close requires an idle/done observation and an unchanged state cursor during output capture;
 - a reviewer can be closed only through the lease created with it;
 - a writer starts only in a linked Git worktree on a non-protected branch;
@@ -45,6 +47,7 @@ herdr-mesh-safe
    ├── exclusive controller lease and fence
    ├── reviewer leases
    ├── writer lane leases
+   ├── content-free handoff receipts
    └── read-only Git preflight
           │
           ▼
@@ -58,6 +61,7 @@ ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/reviewer-leases
 ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/writer-leases
 ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/adopted-pane-leases
 ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/controller-leases
+${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/handoff-receipts
 ```
 
 ## Governance adapters
@@ -101,9 +105,12 @@ without exposing its owner PID, lock id, or controller credentials. A foreign-ho
 
 | Tool | Purpose |
 | --- | --- |
-| `herdr_relay` | Submit a prompt to an existing agent under the active controller fence. |
-| `herdr_handoff` | Prompt, wait, and read back a result under the active controller fence. |
-| `herdr_batch_handoff` | Submit up to eight independent prompts, then collect all results or the first result. |
+| `herdr_relay` | Submit to one active leased agent and return a durable receipt. |
+| `herdr_handoff` | Prompt and collect the exact receipt-bound result. |
+| `herdr_batch_handoff` | Submit up to eight independent prompts and collect all results or the first result. |
+| `herdr_collect_handoffs` | Collect one or more pending receipts without submitting a new prompt. |
+| `herdr_handoff_receipt_list` | Inspect content-free receipt state. |
+| `herdr_handoff_receipt_abandon` | Explicitly release an ambiguous barrier after the exact agent is settled. |
 | `herdr_agent_list/get/read` | Inspect agents and their terminal output. |
 | `herdr_agent_wait` | Wait for one exact Herdr state. |
 | `herdr_agent_wait_settled` | Wait for `idle`, `done`, or `blocked`, then return state and output. |
@@ -113,21 +120,51 @@ without exposing its owner PID, lock id, or controller credentials. A foreign-ho
 `after_seq` on the settled waits prevents a terminal state from earlier work
 from satisfying a new wait. A single long MCP request replaces repeated
 client-side polling; an SSE side channel is not required.
-For a leased agent, relay and handoff hold the same reservation lock used by close/release. Relay returns only
-after Herdr observes the agent enter `working`; handoff holds the lock until its requested settled state. A lease
-already in `closing` or `releasing` rejects new prompts.
+For a leased agent, prompt admission first requires an exact settled identity, then records the pre-delivery
+cursor before submission. The receipt binds pane, name, agent kind, working directory, lifecycle lease, and
+cursor. Relay returns only after Herdr confirms that exact identity entered `working` at the next
+cursor. The resulting receipt is an opaque lookup key; it contains no fence, prompt, or output. Until that
+receipt is completed, failed, or explicitly abandoned, every later prompt to that target is rejected. A lease
+already in `closing` or `releasing` also rejects new prompts.
 
 Batch handoff validates every target under the same controller fence and lifecycle reservations before it
-submits any prompt. Every batch target must have one active retained lease; the bridge resolves its exact pane
-identity before delivery. Use the single-agent handoff for an unleased legacy agent. `mode=all` returns results
-in request order. `mode=first` cancels only the losing CLI waits;
-the other agents continue working and are returned as `pendingTargets`. A partial delivery is reported
-explicitly because an accepted prompt cannot be rolled back safely.
+submits any prompt. Every batch target must have one active retained lease; unleased legacy targets are rejected.
+`mode=all` returns results in request order. `mode=first` cancels only the losing CLI waits; the other agents
+continue working and are returned as `pendingReceipts`. Collection requires those tokens, waits strictly after
+the accepted `working` cursor, and re-reads identity and sequence after output capture. A later task's output is
+therefore rejected rather than mislabeled. A completed receipt may be replayed after a caller crash only while
+its exact settled identity and cursor are still current. An ambiguous delivery remains a blocking `reserved` receipt. An
+operator may release it only with `herdr_handoff_receipt_abandon`, valid controller authority, and a fresh
+observation that the exact leased agent is settled.
+
+### Controller CLI
+
+`herdr-agent-control` is a local CLI for a named coordinator already holding the active controller lease. The
+launcher must set `AGENT_CONTROL_CONTROLLER_ID` to that controller's stable id in the managed coordinator
+environment. `status` and `receipts` are read-only and do not load the fence. Mutating commands load the lease
+only after matching the current Herdr pane, agent name, kind, working directory, and Linux process ancestry to
+the controller process recorded at acquire/resume. The fence never appears in arguments or output.
+
+```text
+herdr-agent-control status
+herdr-agent-control receipts
+herdr-agent-control ask TARGET -- MESSAGE
+herdr-agent-control ask-many --request TARGET=MESSAGE --mode first
+herdr-agent-control collect --receipt TOKEN
+herdr-agent-control abandon --receipt TOKEN
+```
+
+`ask` and `ask-many` use the receipt-bound batch protocol. `collect` never submits a prompt. `abandon` never
+stops a process; it only releases the admission barrier after the exact target is observed settled. Controller
+leases created before process binding was introduced must be resumed once before the mutating CLI can use them.
+The CLI does not start, close, stop, delete, commit, or execute arbitrary terminal commands.
 
 The current controller lease is deliberately bound to a named agent in a managed Herdr pane. MCP clients
 outside Herdr may use read-only inventory and wait tools, but they cannot acquire or exercise coordination
 authority in this version. Supporting an external coordinator requires a separate authenticated caller
 identity; it must not impersonate a pane or pass a self-declared identity.
+Process ancestry is a fail-closed caller binding for the cooperative single-user host model, not isolation from
+a hostile process with the same Unix account and permission to rewrite the mode-`0600` state files.
 
 ### Reviewer lifecycle
 
@@ -313,8 +350,8 @@ The expected sequence is:
 
 1. `herdr_controller_acquire` or `herdr_controller_resume`
 2. `herdr_owned_reviewer_start` with the controller lease/fence and, for Claude, the exact model/effort
-3. `herdr_relay` with the same controller lease/fence
-4. `herdr_agent_wait_settled`
+3. `herdr_relay` with the same controller lease/fence and retain its receipt
+4. `herdr_collect_handoffs` with that receipt
 5. `herdr_owned_reviewer_close` with the same controller lease/fence
 
 ### Start a writer lane

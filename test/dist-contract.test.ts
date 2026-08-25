@@ -57,7 +57,8 @@ const expectedTools = [
   "herdr_agent_wait_any", "herdr_agent_wait_settled", "herdr_bridge_status",
   "herdr_controller_acquire", "herdr_controller_list", "herdr_controller_release",
   "herdr_controller_renew", "herdr_controller_resume", "herdr_controller_takeover",
-  "herdr_batch_handoff", "herdr_handoff", "herdr_integration_status", "herdr_lease_inventory", "herdr_lease_reconcile",
+  "herdr_batch_handoff", "herdr_collect_handoffs", "herdr_handoff", "herdr_handoff_receipt_abandon",
+  "herdr_handoff_receipt_list", "herdr_integration_status", "herdr_lease_inventory", "herdr_lease_reconcile",
   "herdr_owned_pane_adopt", "herdr_owned_pane_close", "herdr_owned_pane_list",
   "herdr_owned_reviewer_cleanup", "herdr_owned_reviewer_close", "herdr_owned_reviewer_list",
   "herdr_owned_reviewer_start", "herdr_owned_worker_list", "herdr_owned_worker_release",
@@ -83,7 +84,7 @@ try {
   assert.equal(handshake.protocol, 2);
   assert.equal(handshake.profile, "safe-orchestration");
   assert.deepEqual(Object.keys(handshake.reservationLocks).sort(), [
-    "adoptedPane", "controller", "reviewer", "writer",
+    "adoptedPane", "controller", "handoffReceipt", "reviewer", "writer",
   ]);
   for (const lock of Object.values(handshake.reservationLocks) as Array<{ state: string; reason: string }>) {
     assert(["absent", "active", "stale", "indeterminate"].includes(lock.state));
@@ -91,7 +92,9 @@ try {
   }
   assert.deepEqual(handshake.capabilities.sort(), [
     "batch-handoff-v1",
+    "controller-cli-v1",
     "controller-fencing-v1",
+    "handoff-receipts-v1",
     "lease-reconciliation-v1",
     "owned-pane-cleanup-v1",
     "owned-reviewer-tabs-v1",

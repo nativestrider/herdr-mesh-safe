@@ -154,7 +154,7 @@ async function getSnapshot(run, target, signal) {
     const result = await run(["agent", "get", target], { timeoutMs: 30_000, signal });
     return { ...extractAgentSnapshot(result.json), target };
 }
-async function waitForSettled(run, target, timeoutMs, afterSeq, signal) {
+export async function waitForSettled(run, target, timeoutMs, afterSeq, signal) {
     const deadline = Date.now() + timeoutMs;
     while (true) {
         const snapshot = await getSnapshot(run, target, signal);

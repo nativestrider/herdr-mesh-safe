@@ -34,6 +34,7 @@ export declare function extractAgentSnapshot(json: unknown): AgentSnapshot;
 export declare function extractAgentSnapshots(json: unknown): AgentSnapshot[];
 export declare function extractPaneId(json: unknown): string;
 export declare function extractWorkspaceId(json: unknown): string;
+export declare function waitForSettled(run: Runner, target: string, timeoutMs: number, afterSeq?: number, signal?: AbortSignal): Promise<AgentSnapshot>;
 export declare function createSafeAgentTools(dependencies?: SafeAgentDependencies): ToolDef[];
 export declare const safeAgentTools: ToolDef[];
 export {};

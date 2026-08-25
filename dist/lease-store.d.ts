@@ -1,3 +1,4 @@
+import type { ProcessIdentity } from "./process-attestation.js";
 export type ReservationLockState = "absent" | "active" | "stale" | "indeterminate";
 export interface ReservationLockStatus {
     state: ReservationLockState;
@@ -96,6 +97,41 @@ export interface ControllerLease {
     expiresAt: string;
     releasedAt?: string;
     predecessorLeaseId?: string;
+    controllerProcess?: ProcessIdentity;
+}
+export type HandoffReceiptState = "reserved" | "pending" | "completed" | "failed";
+export interface HandoffReceipt {
+    version: 1;
+    receiptId: string;
+    controllerId: string;
+    controllerLeaseId: string;
+    target: string;
+    targetLeaseId: string;
+    paneId: string;
+    agentKind: string;
+    cwd: string;
+    state: HandoffReceiptState;
+    createdAt: string;
+    updatedAt: string;
+    beforeSeq: number;
+    afterSeq?: number;
+    settledSeq?: number;
+    failure?: "delivery_failed" | "identity_changed" | "cursor_superseded" | "abandoned";
+}
+export declare class HandoffReceiptStore {
+    readonly directory: string;
+    constructor(stateDir?: string);
+    create(receipt: HandoffReceipt): Promise<void>;
+    update(receipt: HandoffReceipt): Promise<void>;
+    get(receiptId: string): Promise<HandoffReceipt>;
+    list(): Promise<HandoffReceipt[]>;
+    withExclusiveReservation<T>(operation: () => Promise<T>): Promise<T>;
+    private ensureDirectory;
+    private pathFor;
+    private assertReceiptId;
+    private assertRecord;
+    private serialize;
+    private parse;
 }
 export declare class LeaseStore {
     readonly directory: string;

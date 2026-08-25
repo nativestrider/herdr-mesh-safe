@@ -1,6 +1,6 @@
-import { AdoptedPaneLeaseStore, ControllerLeaseStore, LeaseStore, WriterLeaseStore, reservationLockStatus, } from "../lease-store.js";
+import { AdoptedPaneLeaseStore, ControllerLeaseStore, HandoffReceiptStore, LeaseStore, WriterLeaseStore, reservationLockStatus, } from "../lease-store.js";
 import { ok } from "./types.js";
-export const SAFE_BRIDGE_VERSION = "0.1.0-safe.12";
+export const SAFE_BRIDGE_VERSION = "0.1.0-safe.13";
 export const SAFE_BRIDGE_PROTOCOL = 2;
 export const safeStatusTools = [
     {
@@ -12,6 +12,7 @@ export const safeStatusTools = [
             const writer = new WriterLeaseStore();
             const adoptedPane = new AdoptedPaneLeaseStore();
             const controller = new ControllerLeaseStore();
+            const handoffReceipt = new HandoffReceiptStore();
             return ok(JSON.stringify({
                 name: "herdr-mesh-safe",
                 version: SAFE_BRIDGE_VERSION,
@@ -19,7 +20,9 @@ export const safeStatusTools = [
                 profile: "safe-orchestration",
                 capabilities: [
                     "batch-handoff-v1",
+                    "controller-cli-v1",
                     "controller-fencing-v1",
+                    "handoff-receipts-v1",
                     "lease-reconciliation-v1",
                     "owned-pane-cleanup-v1",
                     "owned-reviewer-tabs-v1",
@@ -32,6 +35,7 @@ export const safeStatusTools = [
                     writer: await reservationLockStatus(writer.directory),
                     adoptedPane: await reservationLockStatus(adoptedPane.directory),
                     controller: await reservationLockStatus(controller.directory),
+                    handoffReceipt: await reservationLockStatus(handoffReceipt.directory),
                 },
             }, null, 2));
         },

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 const RESERVATION_LOCK_TTL_MS = 30_000;
@@ -176,8 +176,120 @@ async function withReservationLock(directory, busyMessage, operation) {
         await rm(lockDirectory, { recursive: true, force: true });
     }
 }
+async function syncDirectory(directory) {
+    const handle = await open(directory, "r");
+    try {
+        await handle.sync();
+    }
+    finally {
+        await handle.close();
+    }
+}
+async function durableCreate(directory, destination, contents) {
+    const handle = await open(destination, "wx", 0o600);
+    try {
+        await handle.writeFile(contents, "utf8");
+        await handle.sync();
+    }
+    finally {
+        await handle.close();
+    }
+    await syncDirectory(directory);
+}
+async function durableReplace(directory, destination, contents) {
+    const temporary = `${destination}.${process.pid}.${Date.now()}.tmp`;
+    try {
+        const handle = await open(temporary, "wx", 0o600);
+        try {
+            await handle.writeFile(contents, "utf8");
+            await handle.sync();
+        }
+        finally {
+            await handle.close();
+        }
+        await rename(temporary, destination);
+        await syncDirectory(directory);
+    }
+    catch (error) {
+        await rm(temporary, { force: true });
+        throw error;
+    }
+}
 const LEASE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CONTROLLER_ID = /^[A-Za-z0-9_.-]{1,100}$/;
+export class HandoffReceiptStore {
+    directory;
+    constructor(stateDir = process.env.HERDR_MESH_STATE_DIR ?? join(homedir(), ".local", "state", "herdr-mesh")) {
+        this.directory = join(stateDir, "handoff-receipts");
+    }
+    async create(receipt) {
+        this.assertRecord(receipt);
+        await this.ensureDirectory();
+        await durableCreate(this.directory, this.pathFor(receipt.receiptId), this.serialize(receipt));
+    }
+    async update(receipt) {
+        this.assertRecord(receipt);
+        await this.ensureDirectory();
+        const destination = this.pathFor(receipt.receiptId);
+        await readFile(destination, "utf8");
+        await durableReplace(this.directory, destination, this.serialize(receipt));
+    }
+    async get(receiptId) {
+        this.assertReceiptId(receiptId);
+        return this.parse(await readFile(this.pathFor(receiptId), "utf8"));
+    }
+    async list() {
+        await this.ensureDirectory();
+        const names = (await readdir(this.directory)).filter((name) => name.endsWith(".json")).sort();
+        return Promise.all(names.map(async (name) => this.parse(await readFile(join(this.directory, name), "utf8"))));
+    }
+    async withExclusiveReservation(operation) {
+        await this.ensureDirectory();
+        return withReservationLock(this.directory, "handoff receipt reservation is busy; retry after the active reservation completes", operation);
+    }
+    async ensureDirectory() {
+        await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    }
+    pathFor(receiptId) {
+        this.assertReceiptId(receiptId);
+        return join(this.directory, `${receiptId}.json`);
+    }
+    assertReceiptId(receiptId) {
+        if (!LEASE_ID.test(receiptId))
+            throw new Error("invalid handoff receipt id");
+    }
+    assertRecord(receipt) {
+        this.assertReceiptId(receipt.receiptId);
+        this.assertReceiptId(receipt.controllerLeaseId);
+        this.assertReceiptId(receipt.targetLeaseId);
+        if (receipt.version !== 1 || !CONTROLLER_ID.test(receipt.controllerId)) {
+            throw new Error("invalid handoff receipt record");
+        }
+        if (!receipt.agentKind || !receipt.cwd)
+            throw new Error("handoff receipt lacks exact agent identity");
+        if (!Number.isSafeInteger(receipt.beforeSeq) || receipt.beforeSeq < 0) {
+            throw new Error("handoff receipt lacks a pre-delivery cursor");
+        }
+        if ((receipt.state === "pending" || receipt.state === "completed") &&
+            receipt.afterSeq !== receipt.beforeSeq + 1) {
+            throw new Error("handoff receipt lacks the exact accepted cursor");
+        }
+        if (receipt.state === "completed" && receipt.settledSeq !== Number(receipt.afterSeq) + 1) {
+            throw new Error("completed handoff receipt lacks the exact settled cursor");
+        }
+        if (receipt.state === "failed" && !receipt.failure) {
+            throw new Error("failed handoff receipt lacks a reason");
+        }
+    }
+    serialize(receipt) {
+        return `${JSON.stringify(receipt, null, 2)}\n`;
+    }
+    parse(raw) {
+        const value = JSON.parse(raw);
+        this.assertRecord(value);
+        return value;
+    }
+}
 export class LeaseStore {
     directory;
     constructor(stateDir = process.env.HERDR_MESH_STATE_DIR ?? join(homedir(), ".local", "state", "herdr-mesh")) {
