@@ -7,7 +7,7 @@ const waitOutput = agentTools.find((tool) => tool.name === "herdr_wait_output");
 assert(agentWait?.buildArgs && waitOutput?.buildArgs);
 
 assert.deepEqual(buildRelayArgs("conference_type", "hello"), [
-  "agent", "prompt", "conference_type", "hello",
+  "agent", "prompt", "conference_type", "hello", "--wait", "--until", "working", "--timeout", "5000",
 ]);
 assert.deepEqual(buildHandoffPromptArgs("conference_type", "review", "idle", 5000), [
   "agent", "prompt", "conference_type", "review", "--wait", "--timeout", "5000",

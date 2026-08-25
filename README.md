@@ -8,7 +8,7 @@ This repository is a fork of
 the upstream MCP/Herdr integration and replaces unrestricted terminal lifecycle
 with semantic waits and lease-scoped reviewers and writers.
 
-Current package version: `0.1.0-safe.5`.
+Current package version: `0.1.0-safe.12`.
 
 ## Why this fork exists
 
@@ -19,10 +19,11 @@ raw key injection, or unscoped pane deletion creates unnecessary authority.
 This bridge exposes the operations the coordinator needs while retaining these
 invariants:
 
-- no arbitrary shell execution;
+- no caller-supplied shell command or unrestricted terminal execution;
 - no raw `send-keys`;
 - no unscoped pane, tab, workspace, or session deletion;
-- a blocked or working agent is never closed automatically;
+- controller credentials are checked immediately before bridge prompts and lifecycle requests;
+- automatic close requires an idle/done observation and an unchanged state cursor during output capture;
 - a reviewer can be closed only through the lease created with it;
 - a writer starts only in a linked Git worktree on a non-protected branch;
 - concurrent writers cannot lease overlapping path scopes;
@@ -41,6 +42,7 @@ MCP client
    ▼
 herdr-mesh-safe
    ├── semantic Herdr waits and prompts
+   ├── exclusive controller lease and fence
    ├── reviewer leases
    ├── writer lane leases
    └── read-only Git preflight
@@ -54,6 +56,8 @@ Lease records are stored outside Git with mode `0600` under:
 ```text
 ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/reviewer-leases
 ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/writer-leases
+${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/adopted-pane-leases
+${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/controller-leases
 ```
 
 ## Governance adapters
@@ -74,12 +78,32 @@ The bridge does not install those skills or inherit authority from them.
 
 ## Exposed tools
 
+### Controller lifecycle
+
+| Tool | Purpose |
+| --- | --- |
+| `herdr_controller_acquire` | Acquire the first controller generation from the caller's managed Herdr pane. |
+| `herdr_controller_resume` | Rotate credentials after clear or MCP restart from the same agent identity. |
+| `herdr_controller_takeover` | Transfer an expired lease after the predecessor is missing, done, or blocked. |
+| `herdr_controller_renew` | Extend the current generation before it expires. |
+| `herdr_controller_release` | Invalidate the generation after a durable checkpoint. |
+| `herdr_controller_list` | Inspect controller identity and expiry without exposing fence tokens. |
+
+Acquire or resume the project controller before any prompt, reviewer, writer, or cleanup mutation. The returned
+lease id and fence token are ephemeral capabilities: pass them to mutating tools, but do not publish them in a
+tracker, commit, log, or handoff. Read-only inventory and wait tools remain available without a controller lease.
+The default lease lasts 15 minutes and must be renewed during long coordination turns.
+`herdr_bridge_status` also reports each reservation lock as `absent`, `active`, `stale`, or `indeterminate`
+without exposing its owner PID, lock id, or controller credentials. A foreign-host lock is deliberately
+`indeterminate`; the bridge does not steal it on a time-to-live guess.
+
 ### Coordination
 
 | Tool | Purpose |
 | --- | --- |
-| `herdr_relay` | Submit a prompt to an existing agent. |
-| `herdr_handoff` | Prompt, wait, and read back a result. |
+| `herdr_relay` | Submit a prompt to an existing agent under the active controller fence. |
+| `herdr_handoff` | Prompt, wait, and read back a result under the active controller fence. |
+| `herdr_batch_handoff` | Submit up to eight independent prompts, then collect all results or the first result. |
 | `herdr_agent_list/get/read` | Inspect agents and their terminal output. |
 | `herdr_agent_wait` | Wait for one exact Herdr state. |
 | `herdr_agent_wait_settled` | Wait for `idle`, `done`, or `blocked`, then return state and output. |
@@ -89,27 +113,79 @@ The bridge does not install those skills or inherit authority from them.
 `after_seq` on the settled waits prevents a terminal state from earlier work
 from satisfying a new wait. A single long MCP request replaces repeated
 client-side polling; an SSE side channel is not required.
+For a leased agent, relay and handoff hold the same reservation lock used by close/release. Relay returns only
+after Herdr observes the agent enter `working`; handoff holds the lock until its requested settled state. A lease
+already in `closing` or `releasing` rejects new prompts.
+
+Batch handoff validates every target under the same controller fence and lifecycle reservations before it
+submits any prompt. Every batch target must have one active retained lease; the bridge resolves its exact pane
+identity before delivery. Use the single-agent handoff for an unleased legacy agent. `mode=all` returns results
+in request order. `mode=first` cancels only the losing CLI waits;
+the other agents continue working and are returned as `pendingTargets`. A partial delivery is reported
+explicitly because an accepted prompt cannot be rolled back safely.
+
+The current controller lease is deliberately bound to a named agent in a managed Herdr pane. MCP clients
+outside Herdr may use read-only inventory and wait tools, but they cannot acquire or exercise coordination
+authority in this version. Supporting an external coordinator requires a separate authenticated caller
+identity; it must not impersonate a pane or pass a self-declared identity.
 
 ### Reviewer lifecycle
 
 | Tool | Purpose |
 | --- | --- |
-| `herdr_owned_reviewer_start` | Create a no-focus reviewer pane and persistent lease. |
+| `herdr_owned_reviewer_start` | Create a dedicated no-focus reviewer tab and persistent lease. |
 | `herdr_owned_reviewer_list` | List reviewer leases. |
 | `herdr_owned_reviewer_close` | Capture and close one identity-matched idle/done reviewer. |
 | `herdr_owned_reviewer_cleanup` | Dry-run or clean eligible leased reviewers for one controller. |
 
 Reviewer identity includes controller, agent name and kind, pane, and working
 directory. `working`, `blocked`, unleased, or identity-drifted panes are
-preserved.
+preserved when observed. A newly created tab can exist before its root shell accepts an agent;
+the bridge retries only the exact `agent_pane_busy` readiness condition in that
+same leased pane for a bounded window. Other startup errors fail closed.
+For Claude reviewers, the start manifest may pass an explicit `model` and `effort`; these values become native
+Claude CLI arguments after `--`. Other agent kinds reject explicit model arguments until they have a reviewed
+provider adapter.
 
 ### Writer lifecycle
 
 | Tool | Purpose |
 | --- | --- |
-| `herdr_owned_worker_start` | Validate and reserve a manifest-scoped writer lane, then start its agent. |
+| `herdr_owned_worker_start` | Validate and reserve a manifest-scoped writer lane, then start its agent in a dedicated tab. |
 | `herdr_owned_worker_list` | List writer lane leases. |
 | `herdr_owned_worker_release` | Revalidate a checkpoint, capture output, and release the pane. |
+
+### Host verification
+
+| Tool | Purpose |
+| --- | --- |
+| `herdr_owned_worker_verification_snapshot` | Freeze the settled writer, Git-status, and worktree digests without executing repository code. |
+| `herdr_owned_worker_verify` | Run the selected fixed recipe: `check-docs`, `check-authority`, or `check-fast`. |
+| `herdr_owned_worker_verification_list` | List content-free verification records. |
+
+Verification recipes are code from the leased repository. They run in a Linux Bubblewrap sandbox with fixed
+arguments and no network. They are not a security boundary against an agent that already has the same host user.
+The optional web bootstrap uses the committed lockfile, allows package downloads, and disables package lifecycle
+scripts. A Python bootstrap may warm the run-local `uv` cache from explicitly named `requirements.lock` files;
+each lock must be a regular, non-symlink file whose bytes match the accepted base commit and whose complete
+dependency graph has SHA-256 hashes. The bridge mounts a base-derived copy read-only, ignores lane-local `uv`
+configuration, disables source builds, and uses `uv pip` without starting Python while network is available. The
+final gate remains offline and uses the same isolated cache. When the host resolver is a symlink outside `/etc`, a network-enabled bootstrap
+mounts only its resolved file read-only; offline gates still use a separate network namespace.
+
+### Legacy pane leases
+
+Legacy agents created outside the bridge remain unowned until a coordinator adopts them through a cleanup-only
+lease. Adoption verifies the exact named agent, pane, kind, working directory, settled state cursor, durable
+authority, and protected panes. It grants no Git ownership or implementation authority.
+
+| Tool | Purpose |
+| --- | --- |
+| `herdr_lease_inventory` | Classify live agents as lease-matched, identity-drifted, or unleased. |
+| `herdr_lease_reconcile` | Dry-run or terminalize a failed lease only after the exact pane is confirmed absent. |
+| `herdr_owned_pane_adopt` | Create a cleanup-only lease for one idle/done legacy agent. |
+| `herdr_owned_pane_list` | List cleanup-only leases. |
+| `herdr_owned_pane_close` | Capture and close one adopted pane after a fresh cursor and durable checkpoint. |
 
 Writer admission requires:
 
@@ -126,6 +202,9 @@ Writer admission requires:
 Reservations and releases use an atomic store lock. A crash may deliberately
 leave a retained reservation that requires inspection; it must never admit two
 writers merely to recover automatically.
+On Linux, new reservation locks include the boot id and process start time, so a reboot or reused PID is
+recognized as stale. `herdr_bridge_status` exposes ambiguous legacy or foreign-host locks as `indeterminate`;
+inspect those before any manual recovery instead of deleting them by age.
 
 ### Read-only topology and discovery
 
@@ -135,7 +214,7 @@ integration inspection. Raw lifecycle tools remain filtered by the allow-list in
 
 ## Requirements
 
-- Linux or macOS with Node.js 18 or newer;
+- Linux or macOS with Node.js 18 or newer; host verification additionally requires Linux and Bubblewrap;
 - Git;
 - [Herdr](https://herdr.dev) installed and running;
 - the Herdr integration for each agent kind you plan to launch;
@@ -225,17 +304,18 @@ state plus visible output in one result.
 ### Run a read-only external review
 
 ```text
-Create a leased Claude reviewer in the ticket worktree, ask it to review the
+Create a leased Claude reviewer in a dedicated tab rooted at the ticket worktree, ask it to review the
 exact PR head against Standards and Spec, wait for its result, then reclaim the
 reviewer pane if it is idle or done.
 ```
 
 The expected sequence is:
 
-1. `herdr_owned_reviewer_start`
-2. `herdr_relay`
-3. `herdr_agent_wait_settled`
-4. `herdr_owned_reviewer_close`
+1. `herdr_controller_acquire` or `herdr_controller_resume`
+2. `herdr_owned_reviewer_start` with the controller lease/fence and, for Claude, the exact model/effort
+3. `herdr_relay` with the same controller lease/fence
+4. `herdr_agent_wait_settled`
+5. `herdr_owned_reviewer_close` with the same controller lease/fence
 
 ### Start a writer lane
 
@@ -249,7 +329,7 @@ git -C /absolute/worktree status --porcelain=v1 --untracked-files=all | sha256su
 ```
 
 It calls `herdr_owned_worker_start` with that evidence. The tool independently
-re-reads Git, reserves ownership, creates the pane, starts the agent, and verifies
+re-reads Git, reserves ownership, creates a dedicated no-focus tab, starts the agent in its root pane, and verifies
 its identity before returning an active lease.
 
 The bridge does not confine filesystem writes to the declared scopes. The
@@ -261,10 +341,15 @@ ticket, and repository contract.
 Before release, record a content-free durable checkpoint containing the current
 branch, HEAD, dirty-state digest, completed proof, blockers, and next action.
 Then call `herdr_owned_worker_release` with the checkpoint reference and digest
-plus freshly observed Git values.
+plus the freshly observed agent state cursor and Git values.
 
 Release closes only the leased pane. It does not commit, stash, reset, clean,
 delete, or modify the worktree.
+
+Herdr's current `pane close` command does not accept an expected agent state or cursor. The bridge therefore
+checks identity, settled status, cursor stability, and controller authority immediately before requesting the
+close, but the final check and Herdr close are not one atomic operation. Do not send a manual Herdr prompt or
+otherwise reuse that pane after close begins. Conditional close requires support in Herdr itself.
 
 ## Deliberate limitations
 
@@ -274,6 +359,8 @@ delete, or modify the worktree.
 - The bridge cannot prove that a GitHub Issue grants authority.
 - Ownership is checked at admission and during final coordination; it is not an
   operating-system filesystem sandbox.
+- Controller fencing and cursor checks prevent stale bridge operations, but Herdr does not atomically combine
+  those checks with prompt delivery or pane close. Same-user direct CLI activity remains outside this boundary.
 - Human dialogs and `blocked` agents remain human decisions.
 - Commit, push, PR, merge, deployment, migration, and runtime authority remain
   outside this bridge.
@@ -288,7 +375,8 @@ npm audit --omit=dev
 ```
 
 Tests cover the installed Herdr CLI argument contract, cursor-aware waits,
-reviewer leases, writer ownership conflicts, protected branches, Git-state
+controller fencing and takeover, batch lease identity, sandbox resolver binding, reviewer leases, writer
+ownership conflicts, protected branches, Git-state
 digests, and checkpointed release.
 
 The built `dist/` directory is committed so clients can run the bridge without a
