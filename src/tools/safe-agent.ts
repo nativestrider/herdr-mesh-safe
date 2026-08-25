@@ -4,9 +4,16 @@ import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import { HerdrError, runHerdr, type HerdrResult } from "../herdr.js";
 import { LeaseStore, type ReviewerLease } from "../lease-store.js";
+import {
+  assertControllerAuthority,
+  controllerCredentials,
+  defaultControllerAuthorityDependencies,
+  type ControllerAuthorityDependencies,
+} from "./safe-controller.js";
 import { ok, type ToolDef, type ToolResult, targetSchema } from "./types.js";
 
 const settledStatuses = new Set(["idle", "done", "blocked"]);
+export const MIN_AGENT_START_TIMEOUT_MS = 3_001;
 const agentKinds = [
   "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp",
   "mastracode", "opencode", "copilot", "kimi", "kiro", "droid", "amp", "grok",
@@ -24,31 +31,95 @@ export interface AgentSnapshot {
 }
 
 type Runner = (args: string[], opts?: { timeoutMs?: number; signal?: AbortSignal }) => Promise<HerdrResult>;
+type Pause = (milliseconds: number) => Promise<void>;
 
 export interface SafeAgentDependencies {
   run: Runner;
   store: LeaseStore;
+  controller: ControllerAuthorityDependencies;
   now: () => Date;
   uuid: () => string;
+  pause?: Pause;
 }
 
 const defaultDependencies: SafeAgentDependencies = {
   run: runHerdr,
   store: new LeaseStore(),
+  controller: defaultControllerAuthorityDependencies,
   now: () => new Date(),
   uuid: randomUUID,
+  pause: (milliseconds) => new Promise((resolvePause) => setTimeout(resolvePause, milliseconds)),
 };
 
 export function buildSettledWaitArgs(target: string, timeoutMs: number): string[] {
   return ["agent", "wait", target, "--timeout", String(timeoutMs)];
 }
 
-export function buildPaneSplitArgs(parentPaneId: string, direction: string, cwd: string): string[] {
-  return ["pane", "split", parentPaneId, "--direction", direction, "--cwd", cwd, "--no-focus"];
+export function buildTabCreateArgs(workspaceId: string, cwd: string, label: string): string[] {
+  return ["tab", "create", "--workspace", workspaceId, "--cwd", cwd, "--label", label, "--no-focus"];
 }
 
-export function buildAgentStartArgs(name: string, kind: string, paneId: string, timeoutMs: number): string[] {
-  return ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", String(timeoutMs)];
+export function buildAgentStartArgs(
+  name: string,
+  kind: string,
+  paneId: string,
+  timeoutMs: number,
+  model?: string,
+  effort?: string,
+): string[] {
+  const args = ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", String(timeoutMs)];
+  if (model || effort) {
+    if (kind !== "claude") throw new Error("explicit reviewer model and effort are currently supported only for Claude");
+    args.push("--");
+    if (model) args.push("--model", model);
+    if (effort) args.push("--effort", effort);
+  }
+  return args;
+}
+
+function isAgentPaneBusy(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("agent_pane_busy");
+}
+
+export async function startAgentWhenShellReady(
+  run: Runner,
+  name: string,
+  kind: string,
+  paneId: string,
+  timeoutMs: number,
+  model?: string,
+  effort?: string,
+  pause: Pause = (milliseconds) => new Promise((resolvePause) => setTimeout(resolvePause, milliseconds)),
+  nowMilliseconds: () => number = Date.now,
+): Promise<void> {
+  const intervalMs = 100;
+  const readinessBudgetMs = Math.max(timeoutMs, MIN_AGENT_START_TIMEOUT_MS);
+  const deadline = nowMilliseconds() + readinessBudgetMs;
+  let lastError: unknown;
+  let attempted = false;
+  while (!attempted || nowMilliseconds() < deadline) {
+    const timeRemainingMs = deadline - nowMilliseconds();
+    if (attempted && timeRemainingMs < MIN_AGENT_START_TIMEOUT_MS) break;
+    const probeTimeoutMs = Math.max(
+      MIN_AGENT_START_TIMEOUT_MS,
+      Math.min(readinessBudgetMs, timeRemainingMs),
+    );
+    attempted = true;
+    try {
+      await run(
+        buildAgentStartArgs(name, kind, paneId, probeTimeoutMs, model, effort),
+        { timeoutMs: probeTimeoutMs + 1_000 },
+      );
+      return;
+    } catch (error) {
+      if (!isAgentPaneBusy(error)) throw error;
+      lastError = error;
+      const timeLeft = deadline - nowMilliseconds();
+      if (timeLeft <= 0) break;
+      await pause(Math.min(intervalMs, timeLeft));
+    }
+  }
+  throw lastError ?? new Error("timed out waiting for the target pane to become an available shell");
 }
 
 export function buildPaneCloseArgs(paneId: string): string[] {
@@ -116,6 +187,12 @@ export function extractPaneId(json: unknown): string {
   return String(value.pane_id);
 }
 
+export function extractWorkspaceId(json: unknown): string {
+  const value = findObject(json, (record) => typeof record.workspace_id === "string");
+  if (!value) throw new Error("Herdr response did not contain a workspace id");
+  return String(value.workspace_id);
+}
+
 function remaining(deadline: number): number {
   const value = deadline - Date.now();
   if (value <= 0) throw new HerdrError("timed out waiting for a new settled agent state");
@@ -131,7 +208,7 @@ async function getSnapshot(run: Runner, target: string, signal?: AbortSignal): P
   return { ...extractAgentSnapshot(result.json), target };
 }
 
-async function waitForSettled(
+export async function waitForSettled(
   run: Runner,
   target: string,
   timeoutMs: number,
@@ -189,34 +266,61 @@ async function closeOwnedReviewer(
   dependencies: SafeAgentDependencies,
   leaseId: string,
   controllerId: string,
+  controllerLeaseId: string,
+  controllerFenceToken: string,
+  expectedStateChangeSeq: number,
   lines: number,
 ): Promise<Record<string, unknown>> {
-  const lease = await dependencies.store.get(leaseId);
-  validateLeaseOwner(lease, controllerId);
-  if (lease.state !== "active") throw new Error(`reviewer lease is ${lease.state}, not active`);
-  const snapshot = await validateLeaseIdentity(dependencies.run, lease);
-  if (!settledStatuses.has(snapshot.status) || snapshot.status === "blocked") {
-    throw new Error(`reviewer is ${snapshot.status}; only idle or done reviewers may be closed`);
-  }
-  const output = await readVisible(dependencies.run, lease.agentName, lines);
-  const captureSha256 = createHash("sha256").update(output).digest("hex");
-  await dependencies.store.update({ ...lease, state: "closing", captureSha256 });
+  await assertControllerAuthority(
+    dependencies.controller,
+    controllerId,
+    controllerLeaseId,
+    controllerFenceToken,
+  );
+  const { closing, output } = await dependencies.store.withExclusiveReservation(async () => {
+    const lease = await dependencies.store.get(leaseId);
+    validateLeaseOwner(lease, controllerId);
+    if (lease.state !== "active") throw new Error(`reviewer lease is ${lease.state}, not active`);
+    const snapshot = await validateLeaseIdentity(dependencies.run, lease);
+    if (!settledStatuses.has(snapshot.status) || snapshot.status === "blocked") {
+      throw new Error(`reviewer is ${snapshot.status}; only idle or done reviewers may be closed`);
+    }
+    if (snapshot.stateChangeSeq !== expectedStateChangeSeq) {
+      throw new Error(`agent state cursor is ${snapshot.stateChangeSeq}, expected ${expectedStateChangeSeq}`);
+    }
+    const output = await readVisible(dependencies.run, lease.agentName, lines);
+    const finalSnapshot = await validateLeaseIdentity(dependencies.run, lease);
+    if (
+      (finalSnapshot.status !== "idle" && finalSnapshot.status !== "done") ||
+      finalSnapshot.stateChangeSeq !== snapshot.stateChangeSeq
+    ) {
+      throw new Error("agent state changed while capturing output; refusing to close the pane");
+    }
+    const captureSha256 = createHash("sha256").update(output).digest("hex");
+    const closing: ReviewerLease = { ...lease, state: "closing", captureSha256 };
+    await dependencies.store.update(closing);
+    return { closing, output };
+  });
+  await assertControllerAuthority(
+    dependencies.controller,
+    controllerId,
+    controllerLeaseId,
+    controllerFenceToken,
+  );
   try {
-    await dependencies.run(buildPaneCloseArgs(lease.paneId));
+    await dependencies.run(buildPaneCloseArgs(closing.paneId));
   } catch (error) {
     await dependencies.store.update({
-      ...lease,
+      ...closing,
       state: "close_failed",
-      captureSha256,
       failure: error instanceof Error ? error.message : String(error),
     });
     throw error;
   }
   const closed: ReviewerLease = {
-    ...lease,
+    ...closing,
     state: "closed",
     closedAt: dependencies.now().toISOString(),
-    captureSha256,
   };
   await dependencies.store.update(closed);
   return { lease: closed, terminalOutput: output };
@@ -276,26 +380,34 @@ export function createSafeAgentTools(dependencies = defaultDependencies): ToolDe
     },
     {
       name: "herdr_owned_reviewer_start",
-      description: "Create a no-focus split, start one supported reviewer in it, verify its identity, and persist a lease. This does not accept arbitrary shell commands or agent arguments.",
+      description: "Create a dedicated no-focus tab in the controller's workspace, start one supported reviewer in its root pane, verify its identity, and persist a lease. This never splits the controller tab and does not accept arbitrary shell commands or agent arguments.",
       inputSchema: {
-        controller_id: z.string().min(1).max(100),
+        ...controllerCredentials,
         purpose: z.string().min(1).max(500),
-        parent_pane_id: z.string().min(1),
+        parent_pane_id: z.string().regex(/^[A-Za-z0-9]+:[A-Za-z0-9]+$/),
         cwd: z.string().min(1),
-        name: z.string().regex(/^[A-Za-z0-9_.-]+$/),
+        name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/),
         kind: z.enum(agentKinds),
-        direction: z.enum(["right", "down"]).optional(),
-        start_timeout_ms: z.number().int().positive().max(300_000).optional(),
+        model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$/).optional(),
+        effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
+        start_timeout_ms: z.number().int().min(MIN_AGENT_START_TIMEOUT_MS).max(300_000).optional(),
       },
       run: async (args) => {
+        await assertControllerAuthority(
+          dependencies.controller,
+          String(args.controller_id),
+          String(args.controller_lease_id),
+          String(args.controller_fence_token),
+        );
         const cwdInput = String(args.cwd);
         if (!isAbsolute(cwdInput)) throw new Error("reviewer cwd must be absolute");
         const cwd = await realpath(cwdInput);
         if (!(await stat(cwd)).isDirectory()) throw new Error("reviewer cwd is not a directory");
         const parentPaneId = String(args.parent_pane_id);
-        const direction = String(args.direction ?? "right");
-        const split = await dependencies.run(buildPaneSplitArgs(parentPaneId, direction, cwd));
-        const paneId = extractPaneId(split.json);
+        const parentPane = await dependencies.run(["pane", "get", parentPaneId]);
+        const workspaceId = extractWorkspaceId(parentPane.json);
+        const tab = await dependencies.run(buildTabCreateArgs(workspaceId, cwd, String(args.name)));
+        const paneId = extractPaneId(tab.json);
         const lease: ReviewerLease = {
           version: 1,
           leaseId: dependencies.uuid(),
@@ -317,9 +429,15 @@ export function createSafeAgentTools(dependencies = defaultDependencies): ToolDe
         }
         try {
           const startTimeout = (args.start_timeout_ms as number) ?? 30_000;
-          await dependencies.run(
-            buildAgentStartArgs(lease.agentName, lease.agentKind, paneId, startTimeout),
-            { timeoutMs: startTimeout + 5000 },
+          await startAgentWhenShellReady(
+            dependencies.run,
+            lease.agentName,
+            lease.agentKind,
+            paneId,
+            startTimeout,
+            args.model as string | undefined,
+            args.effort as string | undefined,
+            dependencies.pause,
           );
           await validateLeaseIdentity(dependencies.run, lease);
           const active = { ...lease, state: "active" as const };
@@ -356,13 +474,17 @@ export function createSafeAgentTools(dependencies = defaultDependencies): ToolDe
       description: "Capture and close only an idle or done reviewer whose pane, agent kind, name, cwd, controller, and lease still match. Blocked or working reviewers are refused.",
       inputSchema: {
         lease_id: z.string().uuid(),
-        controller_id: z.string().min(1).max(100),
+        ...controllerCredentials,
+        expected_state_change_seq: z.number().int().nonnegative(),
         read_lines: z.number().int().positive().max(2000).optional(),
       },
       run: async (args) => ok(JSON.stringify(await closeOwnedReviewer(
         dependencies,
         String(args.lease_id),
         String(args.controller_id),
+        String(args.controller_lease_id),
+        String(args.controller_fence_token),
+        Number(args.expected_state_change_seq),
         (args.read_lines as number) ?? 500,
       ), null, 2)),
     },
@@ -370,13 +492,19 @@ export function createSafeAgentTools(dependencies = defaultDependencies): ToolDe
       name: "herdr_owned_reviewer_cleanup",
       description: "Inspect reviewer leases for one controller and optionally close only identity-matched idle/done reviewers. Dry-run is the default; blocked, working, and ambiguous leases are preserved.",
       inputSchema: {
-        controller_id: z.string().min(1).max(100),
+        ...controllerCredentials,
         dry_run: z.boolean().optional(),
         read_lines: z.number().int().positive().max(2000).optional(),
       },
       run: async (args) => {
         const controllerId = String(args.controller_id);
         const dryRun = args.dry_run !== false;
+        await assertControllerAuthority(
+          dependencies.controller,
+          controllerId,
+          String(args.controller_lease_id),
+          String(args.controller_fence_token),
+        );
         const results: Array<Record<string, unknown>> = [];
         for (const lease of await dependencies.store.list(controllerId)) {
           if (lease.state !== "active") continue;
@@ -391,6 +519,9 @@ export function createSafeAgentTools(dependencies = defaultDependencies): ToolDe
                 dependencies,
                 lease.leaseId,
                 controllerId,
+                String(args.controller_lease_id),
+                String(args.controller_fence_token),
+                snapshot.stateChangeSeq,
                 (args.read_lines as number) ?? 500,
               ) });
             }

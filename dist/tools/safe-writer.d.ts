@@ -1,6 +1,7 @@
 import { type GitResult } from "../git.js";
 import { type HerdrResult } from "../herdr.js";
 import { WriterLeaseStore } from "../lease-store.js";
+import { type ControllerAuthorityDependencies } from "./safe-controller.js";
 import { type ToolDef } from "./types.js";
 type HerdrRunner = (args: string[], opts?: {
     timeoutMs?: number;
@@ -14,8 +15,10 @@ export interface SafeWriterDependencies {
     herdr: HerdrRunner;
     git: GitRunner;
     store: WriterLeaseStore;
+    controller: ControllerAuthorityDependencies;
     now: () => Date;
     uuid: () => string;
+    pause?: (milliseconds: number) => Promise<void>;
 }
 export declare function hashGitStatus(status: string): string;
 export declare function normalizeOwnershipScopes(scopes: string[]): string[];

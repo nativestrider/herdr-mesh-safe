@@ -5,7 +5,8 @@ import { z } from "zod";
 import { runGit } from "../git.js";
 import { runHerdr } from "../herdr.js";
 import { WriterLeaseStore } from "../lease-store.js";
-import { buildAgentStartArgs, buildPaneCloseArgs, buildPaneSplitArgs, extractAgentSnapshot, extractAgentSnapshots, extractPaneId, } from "./safe-agent.js";
+import { assertControllerAuthority, controllerCredentials, defaultControllerAuthorityDependencies, } from "./safe-controller.js";
+import { buildPaneCloseArgs, buildTabCreateArgs, extractAgentSnapshot, extractAgentSnapshots, extractPaneId, extractWorkspaceId, MIN_AGENT_START_TIMEOUT_MS, startAgentWhenShellReady, } from "./safe-agent.js";
 import { ok } from "./types.js";
 const agentKinds = [
     "pi", "claude", "codex", "gemini", "cursor", "devin", "agy", "cline", "omp",
@@ -19,8 +20,10 @@ const defaultDependencies = {
     herdr: runHerdr,
     git: runGit,
     store: new WriterLeaseStore(),
+    controller: defaultControllerAuthorityDependencies,
     now: () => new Date(),
     uuid: randomUUID,
+    pause: (milliseconds) => new Promise((resolvePause) => setTimeout(resolvePause, milliseconds)),
 };
 export function hashGitStatus(status) {
     return createHash("sha256").update(status).digest("hex");
@@ -127,14 +130,14 @@ export function createSafeWriterTools(dependencies = defaultDependencies) {
     return [
         {
             name: "herdr_owned_worker_start",
-            description: "Reserve a manifest-scoped Git lane, verify its branch/base/HEAD/status digest and active ownership leases, then start one leased writer. Durable ticket/spec authority must already have been validated by the coordinator.",
+            description: "Reserve a manifest-scoped Git lane, verify its branch/base/HEAD/status digest and active ownership leases, then start one leased writer in a dedicated no-focus tab. The controller tab is never split. Durable ticket/spec authority must already have been validated by the coordinator.",
             inputSchema: {
-                controller_id: z.string().min(1).max(100),
+                ...controllerCredentials,
                 purpose: z.string().min(1).max(500),
                 ticket_ref: z.string().min(1).max(500),
                 authority_ref: z.string().min(1).max(500),
                 authority_sha256: z.string().regex(SHA256),
-                parent_pane_id: z.string().min(1),
+                parent_pane_id: z.string().regex(/^[A-Za-z0-9]+:[A-Za-z0-9]+$/),
                 worktree: z.string().min(1),
                 branch: z.string().min(1).max(500),
                 base_commit: z.string().regex(SHA),
@@ -143,12 +146,12 @@ export function createSafeWriterTools(dependencies = defaultDependencies) {
                 owned_scopes: z.array(z.string()).min(1).max(500),
                 locked_scopes: z.array(z.string()).max(500),
                 protected_branches: z.array(z.string().min(1).max(500)).min(1).max(20),
-                name: z.string().regex(/^[A-Za-z0-9_.-]+$/),
+                name: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/),
                 kind: z.enum(agentKinds),
-                direction: z.enum(["right", "down"]).optional(),
-                start_timeout_ms: z.number().int().positive().max(300_000).optional(),
+                start_timeout_ms: z.number().int().min(MIN_AGENT_START_TIMEOUT_MS).max(300_000).optional(),
             },
             run: async (args) => {
+                await assertControllerAuthority(dependencies.controller, String(args.controller_id), String(args.controller_lease_id), String(args.controller_fence_token));
                 const baseCommit = String(args.base_commit);
                 const expectedHead = String(args.expected_head);
                 const expectedStatusSha256 = String(args.expected_status_sha256);
@@ -196,11 +199,13 @@ export function createSafeWriterTools(dependencies = defaultDependencies) {
                     await dependencies.store.create(lease);
                 });
                 try {
-                    const split = await dependencies.herdr(buildPaneSplitArgs(lease.parentPaneId, String(args.direction ?? "right"), lease.worktree));
-                    lease = { ...lease, paneId: extractPaneId(split.json) };
+                    const parentPane = await dependencies.herdr(["pane", "get", lease.parentPaneId]);
+                    const workspaceId = extractWorkspaceId(parentPane.json);
+                    const tab = await dependencies.herdr(buildTabCreateArgs(workspaceId, lease.worktree, lease.agentName));
+                    lease = { ...lease, paneId: extractPaneId(tab.json) };
                     await dependencies.store.update(lease);
                     const startTimeout = args.start_timeout_ms ?? 30_000;
-                    await dependencies.herdr(buildAgentStartArgs(lease.agentName, lease.agentKind, lease.paneId, startTimeout), { timeoutMs: startTimeout + 5000 });
+                    await startAgentWhenShellReady(dependencies.herdr, lease.agentName, lease.agentKind, lease.paneId, startTimeout, undefined, undefined, dependencies.pause);
                     await getWriterAgent(dependencies.herdr, lease);
                     const active = { ...lease, state: "active" };
                     await dependencies.store.update(active);
@@ -246,7 +251,8 @@ export function createSafeWriterTools(dependencies = defaultDependencies) {
             description: "Release only an idle/done identity-matched writer after revalidating branch, HEAD, Git status digest, and a durable checkpoint reference. The worktree and bytes are preserved.",
             inputSchema: {
                 lease_id: z.string().uuid(),
-                controller_id: z.string().min(1).max(100),
+                ...controllerCredentials,
+                expected_state_change_seq: z.number().int().nonnegative(),
                 expected_head: z.string().regex(SHA),
                 expected_status_sha256: z.string().regex(SHA256),
                 checkpoint_ref: z.string().min(1).max(500),
@@ -254,6 +260,7 @@ export function createSafeWriterTools(dependencies = defaultDependencies) {
                 read_lines: z.number().int().positive().max(2000).optional(),
             },
             run: async (args) => {
+                await assertControllerAuthority(dependencies.controller, String(args.controller_id), String(args.controller_lease_id), String(args.controller_fence_token));
                 const { releasing, output } = await dependencies.store.withExclusiveReservation(async () => {
                     const lease = await dependencies.store.get(String(args.lease_id));
                     if (lease.controllerId !== String(args.controller_id))
@@ -264,9 +271,17 @@ export function createSafeWriterTools(dependencies = defaultDependencies) {
                     if (snapshot.status !== "idle" && snapshot.status !== "done") {
                         throw new Error(`writer is ${snapshot.status}; only idle or done writers may be released`);
                     }
+                    if (snapshot.stateChangeSeq !== Number(args.expected_state_change_seq)) {
+                        throw new Error(`agent state cursor is ${snapshot.stateChangeSeq}, expected ${args.expected_state_change_seq}`);
+                    }
                     const facts = await inspectGit(dependencies.git, lease.worktree, lease.baseCommit);
                     validateExpectedGit(facts, lease.branch, String(args.expected_head), String(args.expected_status_sha256));
                     const output = await readWriterOutput(dependencies.herdr, lease.agentName, args.read_lines ?? 500);
+                    const finalSnapshot = await getWriterAgent(dependencies.herdr, lease);
+                    if ((finalSnapshot.status !== "idle" && finalSnapshot.status !== "done") ||
+                        finalSnapshot.stateChangeSeq !== snapshot.stateChangeSeq) {
+                        throw new Error("agent state changed while capturing output; refusing to release the writer");
+                    }
                     const captureSha256 = createHash("sha256").update(output).digest("hex");
                     const releasing = {
                         ...lease,
@@ -280,6 +295,7 @@ export function createSafeWriterTools(dependencies = defaultDependencies) {
                     await dependencies.store.update(releasing);
                     return { releasing, output };
                 });
+                await assertControllerAuthority(dependencies.controller, String(args.controller_id), String(args.controller_lease_id), String(args.controller_fence_token));
                 try {
                     await dependencies.herdr(buildPaneCloseArgs(releasing.paneId));
                 }

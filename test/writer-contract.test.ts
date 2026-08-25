@@ -8,7 +8,7 @@ import {
   ownershipScopesOverlap,
   createSafeWriterTools,
 } from "../src/tools/safe-writer.js";
-import { WriterLeaseStore, type WriterLease } from "../src/lease-store.js";
+import { ControllerLeaseStore, WriterLeaseStore, type ControllerLease, type WriterLease } from "../src/lease-store.js";
 
 assert.deepEqual(normalizeOwnershipScopes(["docs/adr/", "src/example_app/api/projects.py"]), [
   "docs/adr",
@@ -59,6 +59,26 @@ try {
   await mkdir(lane1);
   await mkdir(lane2);
   const runtimeStore = new WriterLeaseStore(join(stateDir, "runtime"));
+  const controllerStore = new ControllerLeaseStore(join(stateDir, "controller"));
+  const controllerLease: ControllerLease = {
+    version: 1,
+    leaseType: "controller",
+    leaseId: "99999999-9999-4999-8999-999999999999",
+    controllerId: "example-project",
+    fenceToken: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    generation: 1,
+    authorityRef: "https://example.test/spec",
+    authoritySha256: "a".repeat(64),
+    paneId: "w1:p1",
+    agentName: "controller",
+    agentKind: "codex",
+    cwd: stateDir,
+    state: "active",
+    acquiredAt: "2026-08-25T12:00:00.000Z",
+    renewedAt: "2026-08-25T12:00:00.000Z",
+    expiresAt: "2026-08-25T14:00:00.000Z",
+  };
+  await controllerStore.create(controllerLease);
   const base = "5".repeat(40);
   const head = "6".repeat(40);
   const statusText = " M src/example_app/api/projects.py\n";
@@ -66,6 +86,10 @@ try {
   const herdrCalls: string[][] = [];
   let currentWorktree = lane1;
   let currentName = "lane1-writer";
+  let startAttempts = 0;
+  let outputRead = false;
+  let changeAfterRead = true;
+  let paneCloseCalls = 0;
   const fakeGit = async (args: string[]) => {
     const cwd = args[1];
     if (args.includes("--show-toplevel")) return { stdout: `${cwd}\n`, stderr: "" };
@@ -84,28 +108,39 @@ try {
     if (args[0] === "agent" && args[1] === "list") {
       return { json: { result: { agents: [] } }, stdout: "", stderr: "" };
     }
-    if (args[0] === "pane" && args[1] === "split") {
+    if (args[0] === "pane" && args[1] === "get") {
+      return { json: { result: { pane: { pane_id: "w1:p1", workspace_id: "w1" } } }, stdout: "", stderr: "" };
+    }
+    if (args[0] === "tab" && args[1] === "create") {
       currentWorktree = args[args.indexOf("--cwd") + 1];
       return { json: { result: { pane: { pane_id: "w1:p20" } } }, stdout: "", stderr: "" };
     }
     if (args[0] === "agent" && args[1] === "start") {
+      const cliTimeout = Number(args[args.indexOf("--timeout") + 1]);
+      if (cliTimeout <= 3_000) {
+        throw new Error("agent start timeout must be greater than 3000 ms");
+      }
+      startAttempts += 1;
+      if (startAttempts === 1) throw new Error('{"error":{"code":"agent_pane_busy"}}');
       currentName = args[2];
       return { json: { result: { ok: true } }, stdout: "", stderr: "" };
     }
     if (args[0] === "agent" && args[1] === "get") {
       return { json: { result: { agent: {
         agent: "codex",
-        agent_status: "idle",
+        agent_status: outputRead && changeAfterRead ? "working" : "idle",
         cwd: currentWorktree,
         name: currentName,
         pane_id: "w1:p20",
-        state_change_seq: 20,
+        state_change_seq: outputRead && changeAfterRead ? 21 : 20,
       } } }, stdout: "", stderr: "" };
     }
     if (args[0] === "agent" && args[1] === "read") {
+      outputRead = true;
       return { stdout: "writer checkpoint complete", stderr: "" };
     }
     if (args[0] === "pane" && args[1] === "close") {
+      paneCloseCalls += 1;
       return { json: { result: { ok: true } }, stdout: "", stderr: "" };
     }
     throw new Error(`unexpected fake Herdr call: ${args.join(" ")}`);
@@ -118,14 +153,24 @@ try {
     herdr: fakeHerdr,
     git: fakeGit,
     store: runtimeStore,
+    controller: {
+      store: controllerStore,
+      now: () => new Date("2026-08-25T13:00:00.000Z"),
+      callerPaneId: "w1:p1",
+    },
     now: () => new Date("2026-08-25T13:00:00.000Z"),
     uuid: () => ids.shift() ?? "77777777-7777-4777-8777-777777777777",
+    pause: async () => {},
   });
   const startTool = tools.find((tool) => tool.name === "herdr_owned_worker_start");
   const releaseTool = tools.find((tool) => tool.name === "herdr_owned_worker_release");
   assert(startTool?.run && releaseTool?.run);
+  assert.equal(startTool.inputSchema.start_timeout_ms.safeParse(3_000).success, false);
+  assert.equal(startTool.inputSchema.start_timeout_ms.safeParse(3_001).success, true);
   const startArgs = {
     controller_id: "example-project",
+    controller_lease_id: controllerLease.leaseId,
+    controller_fence_token: controllerLease.fenceToken,
     purpose: "Implement ticket 85",
     ticket_ref: "https://github.com/example-org/research-app/issues/85",
     authority_ref: "https://github.com/example-org/research-app/issues/74",
@@ -144,6 +189,7 @@ try {
   };
   await startTool.run(startArgs);
   assert.equal((await runtimeStore.get("55555555-5555-4555-8555-555555555555")).state, "active");
+  assert.equal(startAttempts, 2);
   await assert.rejects(
     startTool.run({
       ...startArgs,
@@ -176,15 +222,27 @@ try {
     }),
     /is protected/,
   );
-  assert.equal(herdrCalls.filter((args) => args[0] === "pane" && args[1] === "split").length, 1);
-  await releaseTool.run({
+  assert.equal(herdrCalls.filter((args) => args[0] === "tab" && args[1] === "create").length, 1);
+  assert.equal(herdrCalls.some((args) => args[0] === "pane" && args[1] === "split"), false);
+  const releaseArgs = {
     lease_id: "55555555-5555-4555-8555-555555555555",
     controller_id: "example-project",
+    controller_lease_id: controllerLease.leaseId,
+    controller_fence_token: controllerLease.fenceToken,
+    expected_state_change_seq: 20,
     expected_head: head,
     expected_status_sha256: statusSha,
     checkpoint_ref: "https://github.com/example-org/research-app/issues/85#issuecomment-1",
     checkpoint_sha256: "b".repeat(64),
-  });
+  };
+  await assert.rejects(releaseTool.run(releaseArgs), /state changed while capturing output/);
+  assert.equal(paneCloseCalls, 0);
+  assert.equal((await runtimeStore.get("55555555-5555-4555-8555-555555555555")).state, "active");
+
+  outputRead = false;
+  changeAfterRead = false;
+  await releaseTool.run(releaseArgs);
+  assert.equal(paneCloseCalls, 1);
   assert.equal((await runtimeStore.get("55555555-5555-4555-8555-555555555555")).state, "released");
 } finally {
   await rm(stateDir, { recursive: true, force: true });
