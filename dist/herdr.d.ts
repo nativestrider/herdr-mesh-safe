@@ -18,4 +18,5 @@ export declare class HerdrError extends Error {
  */
 export declare function runHerdr(args: string[], opts?: {
     timeoutMs?: number;
+    signal?: AbortSignal;
 }): Promise<HerdrResult>;

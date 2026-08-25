@@ -74,7 +74,7 @@ export const agentTools: ToolDef[] = [
     // Allow the subprocess to outlive the requested CLI timeout.
     timeoutMs: 120_000,
     buildArgs: (a) => {
-      const argv = ["agent", "wait", String(a.target), "--status", String(a.status)];
+      const argv = ["agent", "wait", String(a.target), "--until", String(a.status)];
       flag(argv, "--timeout", a.timeout_ms);
       return argv;
     },
@@ -92,7 +92,7 @@ export const agentTools: ToolDef[] = [
     },
     timeoutMs: 120_000,
     buildArgs: (a) => {
-      const argv = ["wait", "output", String(a.pane_id), "--match", String(a.match)];
+      const argv = ["pane", "wait-output", String(a.pane_id), "--match", String(a.match)];
       boolFlag(argv, "--regex", undefined, a.regex);
       flag(argv, "--source", a.source);
       flag(argv, "--timeout", a.timeout_ms);

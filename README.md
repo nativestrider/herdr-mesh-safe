@@ -1,329 +1,289 @@
-# herdr-mesh
+# herdr-mesh-safe
 
-An MCP server for orchestrating multi-agent workflows inside [herdr](https://herdr.dev),
-enabling real-time communication, pane management, and contextual handoffs.
+A safety-scoped MCP bridge for coordinating coding agents in
+[Herdr](https://herdr.dev).
 
-> 한국어: [README.ko.md](./README.ko.md)
+This repository is a fork of
+[`runchr-works/herdr-mesh`](https://github.com/runchr-works/herdr-mesh). It keeps
+the upstream MCP/Herdr integration and replaces unrestricted terminal lifecycle
+with semantic waits and lease-scoped reviewers and writers.
 
-## Why this exists
+Current profile: `0.1.0-epyhia-safe.4`.
 
-herdr already has everything needed to orchestrate multiple agents — real panes,
-persistent sessions, semantic agent state (idle/working/blocked/done), and a CLI +
-socket API to drive it all. What it lacked was a **standard interface for agents
-themselves to use it.**
+## Why this fork exists
 
-So when you run several agents inside herdr (Claude, Codex, …), there was no clean
-way for them to read each other's context, share a session, or pass messages
-without a human shuffling between terminals.
+An orchestration agent needs to inspect workers, send tasks, wait for results,
+and reclaim completed capacity. Giving that agent arbitrary terminal commands,
+raw key injection, or unscoped pane deletion creates unnecessary authority.
 
-herdr-mesh closes that gap: it exposes herdr's CLI as **MCP tools**, so any
-MCP-capable agent — regardless of type — can read other agents' panes, hand off
-context, coordinate, and spawn new agents **on its own, from plain-language
-instructions.** The goal is to make herdr's multi-agent workflow programmable by
-the agents themselves, through one standard, agent-agnostic interface.
+This bridge exposes the operations the coordinator needs while retaining these
+invariants:
 
-## Use cases
+- no arbitrary shell execution;
+- no raw `send-keys`;
+- no unscoped pane, tab, workspace, or session deletion;
+- a blocked or working agent is never closed automatically;
+- a reviewer can be closed only through the lease created with it;
+- a writer starts only in a linked Git worktree on a non-protected branch;
+- concurrent writers cannot lease overlapping path scopes;
+- releasing a writer preserves its branch, worktree, and bytes.
 
-Concrete situations where herdr-mesh turns tedious terminal-shuffling into a
-single natural-language instruction.
+The bridge is a technical safety boundary. It does not decide whether a GitHub
+Issue, spec, ownership declaration, commit, merge, migration, or deployment is
+authorized. The coordinator and the target repository contract remain
+authoritative.
 
-### 1. Code → review → fix loop
+## Architecture
 
-You have Claude writing code and Codex reviewing it. Codex finds a bug — normally
-you'd copy it over to Claude by hand. Instead:
-
-> "Have Codex review the changes Claude just made. If it finds problems, send them
-> to Claude to fix, then ask Codex to re-review. Repeat until it's clean."
-
-The orchestrating agent uses `herdr_agent_read` (pull Codex's review) →
-`herdr_agent_send` (hand the findings to Claude) → `herdr_agent_wait` (let Claude
-finish) → and loops the review. No copy-paste between panes.
-
-### 2. Parallel fan-out
-
-> "Split this refactor: have Claude do the API layer and Codex do the tests, then
-> collect both results and summarize."
-
-Spawns/targets two agents with `herdr_agent_start` / `herdr_agent_send`, waits on
-each with `herdr_agent_wait`, and merges their output with `herdr_agent_read`.
-
-### 3. Long-running handback
-
-> "Tell the build agent to run the full test suite, wait until it prints PASS or
-> FAIL, and bring me the failing cases."
-
-Uses `herdr_pane_run` to kick off the run and `herdr_wait_output` to block on the
-result — so you're notified the moment it's done instead of babysitting the pane.
-
-### 4. Unblock a stuck agent
-
-An agent is sitting at a prompt waiting for confirmation (`blocked`) while you're
-heads-down in another pane.
-
-> "Is any agent blocked waiting on input? If Codex is stuck on a y/n prompt,
-> approve it so it can continue."
-
-`herdr_agent_list` surfaces the `blocked` state; `herdr_agent_send` +
-`herdr_pane_send_keys` answer the prompt — no context-switch on your part.
-
-### 5. Spec → implement → verify pipeline
-
-> "Take the plan in the *architect* agent's pane, give it to Claude to implement,
-> then have the *tester* agent run the suite against the result."
-
-Reads the spec with `herdr_agent_read`, hands it off with `herdr_agent_send`,
-waits with `herdr_agent_wait`, then triggers verification in a third agent — a
-three-stage relay driven by one instruction.
-
-### 6. Route a question to the agent that has the context
-
-> "The agent working in the payments service already has that code loaded — ask it
-> why the webhook retries, and bring me its answer."
-
-Instead of re-loading context yourself, `herdr_agent_send` poses the question to
-the agent already sitting in that codebase and `herdr_agent_read` returns its
-reply.
-
-The point: the agent-to-agent handoffs that used to need a human in the middle
-become one sentence.
-
-herdr already exposes its workspace/agent runtime over a CLI + socket API. `herdr-mesh`
-wraps that CLI as [Model Context Protocol](https://modelcontextprotocol.io) tools, so any
-MCP client can read other agents' panes, send messages, share sessions, and spawn new
-agents through a standard interface.
-
-It is **agent-agnostic**: tools operate on whatever agents herdr recognizes — `pi`, `omp`,
-`claude`, `codex`, `opencode`, `hermes`, `qodercli`, and any future integration. Targets
-accept a terminal id, agent name, reported agent label, or legacy pane id; nothing is tied
-to a specific agent type. Use `herdr_integration_status` to see what's available.
-
-## How it works
-
-```
-MCP client ──stdio(MCP)──> herdr-mesh ──exec "herdr …"──> herdr CLI ──socket──> herdr server
+```text
+MCP client
+   │ stdio
+   ▼
+herdr-mesh-safe
+   ├── semantic Herdr waits and prompts
+   ├── reviewer leases
+   ├── writer lane leases
+   └── read-only Git preflight
+          │
+          ▼
+      Herdr CLI → Herdr socket → managed panes and agents
 ```
 
-Each tool runs the `herdr` CLI as a subprocess and returns its JSON output. No separate
-protocol implementation — herdr's own version/protocol handling stays authoritative.
+Lease records are stored outside Git with mode `0600` under:
+
+```text
+${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/reviewer-leases
+${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/writer-leases
+```
+
+## Exposed tools
+
+### Coordination
+
+| Tool | Purpose |
+| --- | --- |
+| `herdr_relay` | Submit a prompt to an existing agent. |
+| `herdr_handoff` | Prompt, wait, and read back a result. |
+| `herdr_agent_list/get/read` | Inspect agents and their terminal output. |
+| `herdr_agent_wait` | Wait for one exact Herdr state. |
+| `herdr_agent_wait_settled` | Wait for `idle`, `done`, or `blocked`, then return state and output. |
+| `herdr_agent_wait_any` | Wait for the first of up to 16 agents to settle; cancel losing waits. |
+| `herdr_wait_output` | Wait for a pane output match. |
+
+`after_seq` on the settled waits prevents a terminal state from earlier work
+from satisfying a new wait. A single long MCP request replaces repeated
+client-side polling; an SSE side channel is not required.
+
+### Reviewer lifecycle
+
+| Tool | Purpose |
+| --- | --- |
+| `herdr_owned_reviewer_start` | Create a no-focus reviewer pane and persistent lease. |
+| `herdr_owned_reviewer_list` | List reviewer leases. |
+| `herdr_owned_reviewer_close` | Capture and close one identity-matched idle/done reviewer. |
+| `herdr_owned_reviewer_cleanup` | Dry-run or clean eligible leased reviewers for one controller. |
+
+Reviewer identity includes controller, agent name and kind, pane, and working
+directory. `working`, `blocked`, unleased, or identity-drifted panes are
+preserved.
+
+### Writer lifecycle
+
+| Tool | Purpose |
+| --- | --- |
+| `herdr_owned_worker_start` | Validate and reserve a Git lane, then start its writer. |
+| `herdr_owned_worker_list` | List writer lane leases. |
+| `herdr_owned_worker_release` | Revalidate a checkpoint, capture output, and release the pane. |
+
+Writer admission requires:
+
+- durable ticket and authority references plus an accepted SHA-256 digest;
+- an absolute linked Git worktree, not the repository's primary checkout;
+- exact branch, base commit, HEAD, and Git-status digest;
+- at least one protected branch, normally the configured default branch;
+- literal repository-relative owned scopes without globs or `..`;
+- explicit locked scopes;
+- no existing Herdr agent in the worktree;
+- no retained lease for the branch, worktree, overlapping ownership, or locked
+  scope.
+
+Reservations and releases use an atomic store lock. A crash may deliberately
+leave a retained reservation that requires inspection; it must never admit two
+writers merely to recover automatically.
+
+### Read-only topology and discovery
+
+The safe profile also exposes read-only session, pane, tab, workspace, and
+integration inspection. Raw lifecycle tools remain filtered by the allow-list in
+[`src/server.ts`](src/server.ts).
 
 ## Requirements
 
-- Node.js 18+
-- [herdr](https://herdr.dev) installed and a server running (`herdr status` shows `running`).
-  Set `HERDR_BIN` if `herdr` is not on `PATH`.
+- Linux or macOS with Node.js 18 or newer;
+- Git;
+- [Herdr](https://herdr.dev) installed and running;
+- the Herdr integration for each agent kind you plan to launch;
+- an MCP-capable client such as Codex, Claude Code, or OpenCode.
 
-## Install (recommended)
-
-Install globally, then let the built-in installer detect your agents and register
-herdr-mesh with them:
-
-```bash
-npm i -g https://github.com/runchr-works/herdr-mesh/archive/refs/heads/main.tar.gz
-herdr-mesh install
-```
-
-> Installed straight from GitHub (not the npm registry). The repo ships a prebuilt
-> `dist/`, so install needs only network access — no build step. To update later,
-> re-run the same command.
->
-> The shorter `npm i -g runchr-works/herdr-mesh` also works on npm setups that
-> handle git installs cleanly; if it doesn't create a working `herdr-mesh` command,
-> use the tarball URL above. Don't want a global install at all? See
-> [Manual registration](#manual-registration) — `npx` works without one.
-
-`herdr-mesh install` detects installed agents and registers herdr-mesh with the
-ones you pick:
-
-- **Claude Code** — via `claude mcp add -s user`
-- **Codex** — adds `[mcp_servers.herdr-mesh]` to `~/.codex/config.toml`
-- **opencode** — merges into `~/.config/opencode/opencode.json`
-- Other agents — prints the exact config snippet to paste
-
-It is **safe**: existing config is parsed and merged (never overwritten), a `.bak`
-backup is made before writing, and re-running skips agents already registered.
-Use `herdr-mesh install -y` to register with all detected agents non-interactively.
-
-Restart the agent(s) afterward so they pick up herdr-mesh.
-
-## Manual registration
-
-Each agent is its own MCP client; register herdr-mesh once per agent. All agents
-on the same machine share the same herdr socket, so they can see and message each
-other. The server command is `herdr-mesh` (after a global install).
-
-Claude Code:
+Check Herdr before installation:
 
 ```bash
-claude mcp add -s user herdr-mesh herdr-mesh
+herdr status
+herdr integration status
 ```
 
-Codex (`~/.codex/config.toml`):
+Install missing integrations, for example:
+
+```bash
+herdr integration install codex
+herdr integration install claude
+```
+
+## Install from source
+
+```bash
+git clone https://github.com/nativestrider/herdr-mesh-safe.git
+cd herdr-mesh-safe
+npm ci
+npm test
+npm run build
+```
+
+The compiled MCP entrypoint is `dist/index.js`.
+
+### Codex
+
+Add this to `~/.codex/config.toml`, using the absolute clone path:
 
 ```toml
 [mcp_servers.herdr-mesh]
-command = "herdr-mesh"
+command = "node"
+args = ["/absolute/path/to/herdr-mesh-safe/dist/index.js"]
 ```
 
-Generic MCP config (stdio):
-
-```json
-{
-  "mcpServers": {
-    "herdr-mesh": {
-      "command": "herdr-mesh"
-    }
-  }
-}
-```
-
-> Prefer not to install globally? Use `npx -y runchr-works/herdr-mesh` as the
-> command instead of `herdr-mesh` (npx fetches the prebuilt repo from GitHub;
-> first run is slower while it downloads).
-
-## Build from source (local development)
+### Claude Code
 
 ```bash
-git clone https://github.com/runchr-works/herdr-mesh.git
-cd herdr-mesh
-npm install
-npm run build
-node dist/index.js          # run the server directly
-node dist/index.js install  # or run the installer from source
+claude mcp add -s user herdr-mesh node /absolute/path/to/herdr-mesh-safe/dist/index.js
 ```
 
-## Usage — just talk to your agent
+### OpenCode or another MCP client
 
-You don't type tool names. Talk to your agent (Claude, Codex, …) in plain
-language; it decides when to call a herdr-mesh tool and reports back. The phrases
-below are examples of what to say and which capability they trigger.
+Register a local stdio MCP server named `herdr-mesh` with:
 
-**See what's running**
-- "What agents are running in herdr right now?" → lists agents + status
-- "Which agent integrations does herdr support?" → integration status
+```text
+command: node
+arguments: /absolute/path/to/herdr-mesh-safe/dist/index.js
+```
 
-**Read another agent's context (handoff in)**
-- "Read the codex pane and summarize what it's working on."
-- "Grab the last 100 lines from the agent named *reviewer*."
+Restart the MCP client after installation or every bridge update. `/clear` or a
+new conversation inside the same process does not reload an already running MCP
+server.
 
-**Send a message / hand off work**
-- "Tell codex: 'please review the diff on this branch'."
-- "Ask the *reviewer* agent to run the tests and report back."
-- "Send `npm test` to pane w65343…-3 and run it." (executes with Enter)
+## Optional environment
 
-**Coordinate / wait**
-- "Wait until codex is idle, then send it the next task."
-- "Watch the build pane and tell me when it prints 'BUILD SUCCESS'."
+| Variable | Meaning |
+| --- | --- |
+| `HERDR_BIN` | Absolute Herdr executable when `herdr` is not on `PATH`. |
+| `HERDR_MESH_STATE_DIR` | Parent directory for persistent lease stores. |
 
-**Spawn / manage agents**
-- "Start a new codex agent in a split to the right and have it review my work."
-- "Open a new agent named *tester* running claude."
+The MCP process must be able to reach the same Herdr socket as the managed
+workspace. A coordinator already running inside Herdr can use the Herdr CLI, but
+the bridge still provides narrower authority, event-style waits, and verified
+lifecycle.
 
-**Sessions & workspace**
-- "List herdr sessions." / "Create a new workspace for the docs project."
+## How to use it
 
-A typical handoff, all from natural language:
+Users normally speak to the coordinator rather than invoking tool names.
 
-> "Take my current changes, hand them to a fresh codex agent for review, wait
-> for it to finish, then summarize its feedback for me."
+### Wait for several agents
 
-The agent chains `herdr_agent_start` → `herdr_agent_send` → `herdr_agent_wait` →
-`herdr_agent_read` on its own.
+```text
+Wait for the first active worker to become idle, done, or blocked. Use each
+worker's last state-change sequence so an old idle state is not accepted.
+```
 
-**Good to know when phrasing requests**
-- Be explicit about whether you want a message just *delivered* vs *run/submitted*
-  — e.g. "just type it for them" vs "send it and run it". (Delivery only types
-  text into the other agent's input; it does not press Enter.)
-- If output looks empty, ask for it "based on what's **on screen** now". The
-  "recent command output" region can be empty when nothing has been tracked.
+The coordinator uses `herdr_agent_wait_any` and receives the first terminal
+state plus visible output in one result.
 
-## Tools (reference for the LLM)
+### Run a read-only external review
 
-These are the tool names exposed to the agent — listed here for reference, not for
-you to type.
+```text
+Create a leased Claude reviewer in the ticket worktree, ask it to review the
+exact PR head against Standards and Spec, wait for its result, then reclaim the
+reviewer pane if it is idle or done.
+```
 
-**Agent messaging & context (core)**
-- `herdr_relay` — deliver a message to an agent **and submit it** (types + Enter).
-  Preferred for messaging; avoids the "typed but never submitted" pitfall.
-- `herdr_handoff` — send a task, wait for the agent to finish, and read its result
-  back — in one step. Preferred for review/fix/verify loops so the chain can't break.
-- `herdr_agent_list` — list agents with state (idle/working/blocked/done)
-- `herdr_agent_get` — agent details
-- `herdr_agent_read` — read another agent's pane output (context handoff)
-- `herdr_agent_send` — low-level: type literal text to an agent (no Enter)
-- `herdr_agent_wait` — block until an agent reaches a status
-- `herdr_wait_output` — block until a pane's output matches text/regex
+The expected sequence is:
 
-**Agent lifecycle & discovery**
-- `herdr_agent_start` — spawn a new agent terminal (any supported agent)
-- `herdr_agent_rename`, `herdr_agent_focus`
-- `herdr_integration_status` — list agent integrations herdr knows about and their status
+1. `herdr_owned_reviewer_start`
+2. `herdr_relay`
+3. `herdr_agent_wait_settled`
+4. `herdr_owned_reviewer_close`
 
-**Sessions**
-- `herdr_session_list`, `herdr_session_stop`, `herdr_session_delete`
+### Start a writer lane
 
-**Panes**
-- `herdr_pane_list` / `get` / `read` / `split` / `run` / `send_text` / `send_keys` / `close` / `rename`
-- Use `herdr_pane_run` to type a command **and** press Enter; use `*_send_text` for literal text.
+The coordinator first validates the accepted ticket/spec, dependencies,
+ownership, locks, and integration order against durable project state. It then
+collects the exact local evidence, including:
 
-**Tabs & workspaces**
-- `herdr_tab_*` — list / create / get / focus / rename / close
-- `herdr_workspace_*` — list / create / get / focus / rename / close
+```bash
+git -C /absolute/worktree rev-parse HEAD
+git -C /absolute/worktree status --porcelain=v1 --untracked-files=all | sha256sum
+```
 
-## Behavior notes (for the LLM / developers)
+It calls `herdr_owned_worker_start` with that evidence. The tool independently
+re-reads Git, reserves ownership, creates the pane, starts the agent, and verifies
+its identity before returning an active lease.
 
-Tool-level behavior details — not end-user tips, but what the LLM relies on to
-use the tools correctly and what developers should understand.
+The bridge does not confine filesystem writes to the declared scopes. The
+coordinator must still compare the final changed paths and diff with the lease,
+ticket, and repository contract.
 
-- **Sending messages / commands**
-  - Deliver text only: `herdr_agent_send` (does not press Enter)
-  - Also submit it: follow with `herdr_pane_send_keys` sending `enter`
-  - Run a shell command: `herdr_pane_run` (types **and** presses Enter) — simplest
-- **Reading output**: for context retrieval, `source: "visible"` most reliably
-  returns on-screen content. `recent` / `recent-unwrapped` can be empty when there
-  is no tracked command-output region.
+### Release a writer
 
-## Context & session sharing
+Before release, record a content-free durable checkpoint containing the current
+branch, HEAD, dirty-state digest, completed proof, blockers, and next action.
+Then call `herdr_owned_worker_release` with the checkpoint reference and digest
+plus freshly observed Git values.
 
-- **Context sharing**: pull another agent's output with `herdr_agent_read`, push to
-  it with `herdr_agent_send` / `herdr_pane_run`.
-- **Sessions**: all agents attached to the same herdr server already share one
-  session (socket) — that's the foundation context sharing relies on. Over MCP you
-  can observe/manage sessions (`session_list` / `stop` / `delete`). Human remote
-  `session attach` (SSH attach) is a native herdr feature and interactive, so it is
-  intentionally excluded from the MCP tools.
+Release closes only the leased pane. It does not commit, stash, reset, clean,
+delete, or modify the worktree.
 
-## Troubleshooting
+## Deliberate limitations
 
-Natural-language requests usually work, but the agent (an LLM) ultimately decides
-whether and how to call the tools, so it isn't 100% deterministic. If something
-doesn't happen:
-
-- **The agent answered without acting.** Be explicit: name the capability, e.g.
-  "use herdr-mesh to message codex" or "call the herdr tools to do this".
-- **A message was sent but nothing ran.** `herdr_agent_send` types without Enter.
-  Ask to "send it **and run it**", or rely on `herdr_relay` / `herdr_handoff`,
-  which submit for you.
-- **Wrong or missing target.** Tell it to "list the agents first", then refer to
-  one by the name/id from that list.
-- **Read came back empty.** Ask for output "from what's **on screen** now"
-  (`source: visible`); tracked "recent" output can be empty.
-- **A multi-step handoff stalled midway.** Use `herdr_handoff` (send + wait + read
-  in one tool) instead of asking the agent to chain several calls itself.
-- **Tools not available at all.** Check the server is connected: `claude mcp list`
-  or `/mcp` inside the session. Confirm herdr is up with `herdr status`.
-- **Still stuck?** Errors are returned verbatim from herdr, so ask the agent to
-  "show the exact error it got" — it usually names the cause (e.g. `agent_not_found`).
+- Independent clones are not accepted as writer lanes in this version; use
+  linked Git worktrees.
+- Existing workers created before leases are not automatically adopted.
+- The bridge cannot prove that a GitHub Issue grants authority.
+- Ownership is checked at admission and during final coordination; it is not an
+  operating-system filesystem sandbox.
+- Human dialogs and `blocked` agents remain human decisions.
+- Commit, push, PR, merge, deployment, migration, and runtime authority remain
+  outside this bridge.
 
 ## Development
 
 ```bash
-npm run dev    # run from source via tsx
-npm run build  # compile to dist/
+npm ci
+npm test
+npm run build
+npm audit --omit=dev
 ```
 
-> `dist/` is committed so the package installs from GitHub without a build step.
-> After changing anything under `src/`, run `npm run build` and commit `dist/` too.
+Tests cover the installed Herdr CLI argument contract, cursor-aware waits,
+reviewer leases, writer ownership conflicts, protected branches, Git-state
+digests, and checkpointed release.
 
-## License
+The built `dist/` directory is committed so clients can run the bridge without a
+TypeScript toolchain. Change source first, run the full commands above, and
+commit source, tests, lockfile, and generated output together.
 
-MIT
+## Upstream and license
+
+Based on `runchr-works/herdr-mesh` at upstream commit `54adef5`. Upstream remains
+the source for the generic Herdr MCP transport and installer; this fork owns the
+safe allow-list, semantic waits, and lease lifecycle.
+
+Licensed under the MIT License. See [`LICENSE`](LICENSE); the upstream copyright
+notice is preserved.

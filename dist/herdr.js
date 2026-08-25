@@ -19,7 +19,7 @@ export class HerdrError extends Error {
 export async function runHerdr(args, opts = {}) {
     const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     return new Promise((resolve, reject) => {
-        execFile(HERDR_BIN, args, { timeout, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (error, stdout, stderr) => {
+        execFile(HERDR_BIN, args, { timeout, maxBuffer: MAX_BUFFER, encoding: "utf8", signal: opts.signal }, (error, stdout, stderr) => {
             const out = stdout ?? "";
             const err = stderr ?? "";
             if (error) {
@@ -28,6 +28,10 @@ export async function runHerdr(args, opts = {}) {
                 if (code === "ENOENT") {
                     reject(new HerdrError(`herdr CLI not found (tried "${HERDR_BIN}"). Install it from https://herdr.dev ` +
                         `or set HERDR_BIN to its path.`));
+                    return;
+                }
+                if (code === "ABORT_ERR" || opts.signal?.aborted) {
+                    reject(new HerdrError(`herdr command cancelled: herdr ${args.join(" ")}`));
                     return;
                 }
                 if (error.killed) {

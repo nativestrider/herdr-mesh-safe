@@ -1,65 +1,35 @@
 import { z } from "zod";
 import { runHerdr } from "../herdr.js";
 import { ok, formatResult, targetSchema } from "./types.js";
-/** Recursively find the first `pane_id` value in a parsed herdr JSON response. */
-function findPaneId(node) {
-    if (!node || typeof node !== "object")
-        return undefined;
-    if (Array.isArray(node)) {
-        for (const item of node) {
-            const found = findPaneId(item);
-            if (found)
-                return found;
-        }
-        return undefined;
-    }
-    const obj = node;
-    if (typeof obj.pane_id === "string")
-        return obj.pane_id;
-    for (const v of Object.values(obj)) {
-        const found = findPaneId(v);
-        if (found)
-            return found;
-    }
-    return undefined;
+export function buildRelayArgs(target, text) {
+    return ["agent", "prompt", target, text];
 }
-/** Resolve a target (agent name/label/id) to its pane id, needed to send keys.
- * Tries `agent get` first, then `pane get` so a raw pane id also works. */
-async function resolvePaneId(target) {
-    for (const cmd of [["agent", "get", target], ["pane", "get", target]]) {
-        try {
-            const res = await runHerdr(cmd);
-            const paneId = findPaneId(res.json);
-            if (paneId)
-                return paneId;
-        }
-        catch {
-            /* try next resolver */
-        }
-    }
-    throw new Error(`could not resolve pane_id for target "${target}"`);
+export function buildHandoffPromptArgs(target, message, status, timeout) {
+    const argv = ["agent", "prompt", target, message, "--wait"];
+    if (status && status !== "idle")
+        argv.push("--until", status);
+    argv.push("--timeout", String(timeout));
+    return argv;
 }
 export const compositeTools = [
     {
         name: "herdr_relay",
-        description: "Deliver a message to an agent AND submit it (types the text, then presses Enter). Use this for normal agent-to-agent messaging — it avoids the common mistake of sending text that never gets submitted. Set submit=false to type without Enter.",
+        description: "Deliver and submit a prompt to an agent with the current Herdr agent prompt command.",
         inputSchema: {
             target: targetSchema,
             text: z.string().describe("Message/prompt to deliver to the agent."),
             submit: z
                 .boolean()
                 .optional()
-                .describe("Press Enter after typing (default true)."),
+                .describe("Must remain true; the current bridge supports submitted prompts only."),
         },
         run: async (a) => {
             const target = String(a.target);
-            const submit = a.submit !== false;
-            // Resolve pane first so a bad target fails before we type anything.
-            const paneId = submit ? await resolvePaneId(target) : undefined;
-            await runHerdr(["agent", "send", target, String(a.text)]);
-            if (submit && paneId)
-                await runHerdr(["pane", "send-keys", paneId, "enter"]);
-            return ok(`Delivered to "${target}"${submit ? " and submitted (Enter)" : " (not submitted)"}.`);
+            if (a.submit === false) {
+                throw new Error("herdr_relay requires submit=true with the installed Herdr CLI");
+            }
+            await runHerdr(buildRelayArgs(target, String(a.text)));
+            return ok(`Delivered to "${target}" and submitted.`);
         },
     },
     {
@@ -92,12 +62,9 @@ export const compositeTools = [
             const status = a.wait_status ?? "idle";
             const timeout = a.timeout_ms ?? 120_000;
             const lines = a.read_lines ?? 200;
-            const paneId = await resolvePaneId(target);
-            await runHerdr(["agent", "send", target, String(a.message)]);
-            await runHerdr(["pane", "send-keys", paneId, "enter"]);
             let waitNote = `reached ${status}`;
             try {
-                await runHerdr(["agent", "wait", target, "--status", status, "--timeout", String(timeout)], { timeoutMs: timeout + 10_000 });
+                await runHerdr(buildHandoffPromptArgs(target, String(a.message), status, timeout), { timeoutMs: timeout + 10_000 });
             }
             catch (err) {
                 // Don't lose the output if the wait times out — read whatever is there.

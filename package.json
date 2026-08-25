@@ -1,10 +1,11 @@
 {
-  "name": "herdr-mesh",
-  "version": "0.1.0",
-  "description": "An MCP server for orchestrating multi-agent workflows inside herdr, enabling real-time communication, pane management, and contextual handoffs.",
+  "name": "herdr-mesh-safe",
+  "version": "0.1.0-epyhia-safe.4",
+  "description": "A safety-scoped MCP bridge for semantic waits and lease-managed agents in Herdr.",
   "type": "module",
   "bin": {
-    "herdr-mesh": "dist/index.js"
+    "herdr-mesh": "dist/index.js",
+    "herdr-mesh-safe": "dist/index.js"
   },
   "files": [
     "dist"
@@ -12,7 +13,8 @@
   "scripts": {
     "build": "tsc && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "keywords": [
     "mcp",
@@ -22,11 +24,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/runchr-works/herdr-mesh.git"
+    "url": "git+https://github.com/nativestrider/herdr-mesh-safe.git"
   },
-  "homepage": "https://github.com/runchr-works/herdr-mesh#readme",
+  "homepage": "https://github.com/nativestrider/herdr-mesh-safe#readme",
   "bugs": {
-    "url": "https://github.com/runchr-works/herdr-mesh/issues"
+    "url": "https://github.com/nativestrider/herdr-mesh-safe/issues"
   },
   "license": "MIT",
   "dependencies": {

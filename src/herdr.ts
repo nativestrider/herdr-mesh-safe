@@ -30,7 +30,7 @@ export class HerdrError extends Error {
  */
 export async function runHerdr(
   args: string[],
-  opts: { timeoutMs?: number } = {},
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<HerdrResult> {
   const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
@@ -38,7 +38,7 @@ export async function runHerdr(
     execFile(
       HERDR_BIN,
       args,
-      { timeout, maxBuffer: MAX_BUFFER, encoding: "utf8" },
+      { timeout, maxBuffer: MAX_BUFFER, encoding: "utf8", signal: opts.signal },
       (error, stdout, stderr) => {
         const out = stdout ?? "";
         const err = stderr ?? "";
@@ -53,6 +53,10 @@ export async function runHerdr(
                   `or set HERDR_BIN to its path.`,
               ),
             );
+            return;
+          }
+          if (code === "ABORT_ERR" || opts.signal?.aborted) {
+            reject(new HerdrError(`herdr command cancelled: herdr ${args.join(" ")}`));
             return;
           }
           if ((error as { killed?: boolean }).killed) {
