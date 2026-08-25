@@ -10,9 +10,9 @@ import {
 } from "../src/tools/safe-writer.js";
 import { WriterLeaseStore, type WriterLease } from "../src/lease-store.js";
 
-assert.deepEqual(normalizeOwnershipScopes(["docs/adr/", "src/epyhia/api/projects.py"]), [
+assert.deepEqual(normalizeOwnershipScopes(["docs/adr/", "src/example_app/api/projects.py"]), [
   "docs/adr",
-  "src/epyhia/api/projects.py",
+  "src/example_app/api/projects.py",
 ]);
 assert.throws(() => normalizeOwnershipScopes(["../outside"]), /repository-relative/);
 assert.throws(() => normalizeOwnershipScopes(["docs/*"]), /literal path segments/);
@@ -27,19 +27,19 @@ try {
     version: 1,
     leaseType: "writer",
     leaseId: "44444444-4444-4444-8444-444444444444",
-    controllerId: "epyhia",
+    controllerId: "example-project",
     purpose: "Implement ticket 85",
-    ticketRef: "https://github.com/nativestrider/epyhia/issues/85",
-    authorityRef: "https://github.com/nativestrider/epyhia/issues/74",
+    ticketRef: "https://github.com/example-org/research-app/issues/85",
+    authorityRef: "https://github.com/example-org/research-app/issues/74",
     authoritySha256: "a".repeat(64),
     parentPaneId: "w1:p1",
     paneId: "w1:p4",
     agentName: "epy85-writer",
     agentKind: "codex",
-    repositoryRoot: "/work/epyhia-wt-0085",
-    gitDir: "/work/epyhia/.git/worktrees/epyhia-wt-0085",
-    gitCommonDir: "/work/epyhia/.git",
-    worktree: "/work/epyhia-wt-0085",
+    repositoryRoot: "/work/research-app-wt-0085",
+    gitDir: "/work/research-app/.git/worktrees/research-app-wt-0085",
+    gitCommonDir: "/work/research-app/.git",
+    worktree: "/work/research-app-wt-0085",
     branch: "codex/0085-adrs",
     baseCommit: "1".repeat(40),
     headCommit: "2".repeat(40),
@@ -52,7 +52,7 @@ try {
   };
   await store.create(lease);
   assert.deepEqual(await store.get(lease.leaseId), lease);
-  assert.deepEqual(await store.list("epyhia"), [lease]);
+  assert.deepEqual(await store.list("example-project"), [lease]);
 
   const lane1 = join(stateDir, "lane1");
   const lane2 = join(stateDir, "lane2");
@@ -61,7 +61,7 @@ try {
   const runtimeStore = new WriterLeaseStore(join(stateDir, "runtime"));
   const base = "5".repeat(40);
   const head = "6".repeat(40);
-  const statusText = " M src/epyhia/api/projects.py\n";
+  const statusText = " M src/example_app/api/projects.py\n";
   const statusSha = hashGitStatus(statusText);
   const herdrCalls: string[][] = [];
   let currentWorktree = lane1;
@@ -125,10 +125,10 @@ try {
   const releaseTool = tools.find((tool) => tool.name === "herdr_owned_worker_release");
   assert(startTool?.run && releaseTool?.run);
   const startArgs = {
-    controller_id: "epyhia",
+    controller_id: "example-project",
     purpose: "Implement ticket 85",
-    ticket_ref: "https://github.com/nativestrider/epyhia/issues/85",
-    authority_ref: "https://github.com/nativestrider/epyhia/issues/74",
+    ticket_ref: "https://github.com/example-org/research-app/issues/85",
+    authority_ref: "https://github.com/example-org/research-app/issues/74",
     authority_sha256: "a".repeat(64),
     parent_pane_id: "w1:p1",
     worktree: lane1,
@@ -136,7 +136,7 @@ try {
     base_commit: base,
     expected_head: head,
     expected_status_sha256: statusSha,
-    owned_scopes: ["src/epyhia/api/projects.py"],
+    owned_scopes: ["src/example_app/api/projects.py"],
     locked_scopes: ["docs/CURRENT.md"],
     protected_branches: ["main"],
     name: "lane1-writer",
@@ -150,7 +150,7 @@ try {
       worktree: lane2,
       branch: "codex/lane2",
       name: "lane2-writer",
-      owned_scopes: ["src/epyhia/api"],
+      owned_scopes: ["src/example_app/api"],
     }),
     /ownership overlaps/,
   );
@@ -179,10 +179,10 @@ try {
   assert.equal(herdrCalls.filter((args) => args[0] === "pane" && args[1] === "split").length, 1);
   await releaseTool.run({
     lease_id: "55555555-5555-4555-8555-555555555555",
-    controller_id: "epyhia",
+    controller_id: "example-project",
     expected_head: head,
     expected_status_sha256: statusSha,
-    checkpoint_ref: "https://github.com/nativestrider/epyhia/issues/85#issuecomment-1",
+    checkpoint_ref: "https://github.com/example-org/research-app/issues/85#issuecomment-1",
     checkpoint_sha256: "b".repeat(64),
   });
   assert.equal((await runtimeStore.get("55555555-5555-4555-8555-555555555555")).state, "released");

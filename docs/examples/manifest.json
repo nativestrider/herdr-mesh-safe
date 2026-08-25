@@ -1,0 +1,28 @@
+{
+  "controller_id": "research-app",
+  "purpose": "Implement ticket #85 evidence contract",
+  "ticket_ref": "https://github.com/example-org/research-app/issues/85",
+  "authority_ref": "https://github.com/example-org/research-app/issues/74",
+  "authority_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "parent_pane_id": "w1:p1",
+  "worktree": "/srv/work/research-app-wt-0085",
+  "branch": "codex/0085-evidence-contract",
+  "base_commit": "1111111111111111111111111111111111111111",
+  "expected_head": "2222222222222222222222222222222222222222",
+  "expected_status_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "owned_scopes": [
+    "src/research_app/evidence.py",
+    "tests/test_evidence.py"
+  ],
+  "locked_scopes": [
+    "docs/CURRENT.md",
+    "src/research_app/schema"
+  ],
+  "protected_branches": [
+    "main"
+  ],
+  "name": "ticket-85-writer",
+  "kind": "codex",
+  "direction": "right",
+  "start_timeout_ms": 30000
+}

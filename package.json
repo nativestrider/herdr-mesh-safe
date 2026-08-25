@@ -1,6 +1,6 @@
 {
   "name": "herdr-mesh-safe",
-  "version": "0.1.0-epyhia-safe.4",
+  "version": "0.1.0-safe.5",
   "description": "A safety-scoped MCP bridge for semantic waits and lease-managed agents in Herdr.",
   "type": "module",
   "bin": {

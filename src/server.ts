@@ -54,7 +54,7 @@ const allTools: ToolDef[] = [
 export function createServer(): McpServer {
   const server = new McpServer({
     name: "herdr-mesh",
-    version: "0.1.0-epyhia-safe.4",
+    version: "0.1.0-safe.5",
   });
 
   for (const tool of allTools) {

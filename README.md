@@ -8,7 +8,7 @@ This repository is a fork of
 the upstream MCP/Herdr integration and replaces unrestricted terminal lifecycle
 with semantic waits and lease-scoped reviewers and writers.
 
-Current profile: `0.1.0-epyhia-safe.4`.
+Current package version: `0.1.0-safe.5`.
 
 ## Why this fork exists
 
@@ -56,6 +56,22 @@ ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/reviewer-leases
 ${HERDR_MESH_STATE_DIR:-~/.local/state/herdr-mesh}/writer-leases
 ```
 
+## Governance adapters
+
+Writer tools require an external governance process that accepts the work,
+declares ownership, and records durable checkpoints. Read the
+[`governance integration contract`](docs/governance-integration.md) before
+enabling writers.
+
+The [`GitHub control-plane example`](docs/examples/github-control-plane.md)
+shows one practical adapter using Issues, a GitHub Project, PRs, and content-free
+checkpoints. GitHub is an example, not a bridge dependency. A complete tool input
+is available in [`manifest.json`](docs/examples/manifest.json).
+
+The optional [`agent-control-skills`](https://github.com/nativestrider/agent-control-skills)
+bundle provides reusable coordinator instructions for this governance boundary.
+The bridge does not install those skills or inherit authority from them.
+
 ## Exposed tools
 
 ### Coordination
@@ -91,7 +107,7 @@ preserved.
 
 | Tool | Purpose |
 | --- | --- |
-| `herdr_owned_worker_start` | Validate and reserve a Git lane, then start its writer. |
+| `herdr_owned_worker_start` | Validate and reserve a manifest-scoped writer lane, then start its agent. |
 | `herdr_owned_worker_list` | List writer lane leases. |
 | `herdr_owned_worker_release` | Revalidate a checkpoint, capture output, and release the pane. |
 

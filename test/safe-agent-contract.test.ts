@@ -58,7 +58,7 @@ try {
   const lease: ReviewerLease = {
     version: 1,
     leaseId: "11111111-1111-4111-8111-111111111111",
-    controllerId: "epyhia-control",
+    controllerId: "example-control",
     purpose: "Review ticket 85",
     parentPaneId: "w1:p1",
     paneId: "w1:p2",
@@ -70,7 +70,7 @@ try {
   };
   await store.create(lease);
   assert.deepEqual(await store.get(lease.leaseId), lease);
-  assert.deepEqual(await store.list("epyhia-control"), [lease]);
+  assert.deepEqual(await store.list("example-control"), [lease]);
 
   const closed = { ...lease, state: "closed" as const, closedAt: "2026-08-25T10:10:00.000Z" };
   await store.update(closed);
@@ -166,7 +166,7 @@ try {
   const closeTool = tools.find((tool) => tool.name === "herdr_owned_reviewer_close");
   assert(startTool?.run && closeTool?.run);
   await startTool.run({
-    controller_id: "epyhia-control",
+    controller_id: "example-control",
     purpose: "Review ticket 85",
     parent_pane_id: "w1:p1",
     cwd: stateDir,
@@ -176,7 +176,7 @@ try {
   assert.equal((await runtimeStore.get("22222222-2222-4222-8222-222222222222")).state, "active");
   await closeTool.run({
     lease_id: "22222222-2222-4222-8222-222222222222",
-    controller_id: "epyhia-control",
+    controller_id: "example-control",
   });
   const captured = await runtimeStore.get("22222222-2222-4222-8222-222222222222");
   assert.equal(captured.state, "closed");
